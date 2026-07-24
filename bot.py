@@ -147,6 +147,9 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     storage.init_db()
+    # Python 3.14 removed asyncio.get_event_loop()'s implicit loop creation, which
+    # python-telegram-bot's run_polling() still relies on. Set one explicitly.
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
