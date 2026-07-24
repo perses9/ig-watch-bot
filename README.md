@@ -113,13 +113,21 @@ docker run -d --env-file .env -v $(pwd)/data:/app ig-watch-bot
 
 ## Rate-limit note
 
-Instagram will throttle or temporarily block an IP that polls too
-aggressively, especially with many tracked usernames on one bot. The check
-job already spaces individual requests out (1-3s jitter) and treats
-`429`/timeouts as "temporary check issue, not a real change" rather than a
-status flip. If you track a lot of accounts and see frequent temporary
-check issues in the logs, raise `CHECK_INTERVAL_SECONDS` or route requests
-through a proxy.
+Instagram treats datacenter IPs (Railway, any VPS, AWS, etc.) with much more
+suspicion than home/mobile connections, and can block a whole hosting
+provider's IP range outright regardless of how browser-like the requests
+look. The checker already does what's possible on the request side (real
+browser headers, session-cookie warmup, matching the exact host/endpoint a
+logged-out browser uses) and backs off automatically on `429`s — but if
+Instagram has flagged the IP range itself, no request-shaping fixes it.
+
+The actual fix at that point is a residential/mobile proxy: set `PROXY_URL`
+(see `.env.example`) to a provider's proxy endpoint and every request routes
+through a real residential/mobile IP instead of the server's own. Bright
+Data, Oxylabs, Smartproxy, and IPRoyal all offer this; pricing is usage-based,
+typically $10-50+/mo depending on volume. Prefer a per-request rotating IP
+plan over a sticky one, since a fresh IP on every check is exactly what
+prevents a block from forming in the first place.
 
 ## Environment variables
 
@@ -129,6 +137,8 @@ through a proxy.
 | `CHECK_INTERVAL_SECONDS` | `15`             | How often every watched account is rechecked |
 | `CONFIRM_CHECKS`         | `2`              | Consecutive matching checks needed before announcing a status change |
 | `DB_PATH`                | `watchlist.db`   | SQLite file storing watchlists + status    |
+| `ALLOWED_CHAT_IDS`       | *(none)*         | Comma-separated Telegram chat IDs allowed to use the bot |
+| `PROXY_URL`              | *(none)*         | Residential/mobile proxy URL to route all Instagram requests through |
 
 ## Note on this build
 

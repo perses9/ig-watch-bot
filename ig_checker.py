@@ -1,9 +1,20 @@
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
 APP_ID = "936619743392459"  # public X-IG-App-ID used by instagram.com's own web client
+
+# Residential/mobile proxy URL, e.g. http://user:pass@gate.provider.com:8000
+# Every request routes through this if set. Without it, all requests come
+# from this server's own IP, which datacenter hosts (Railway, any VPS) get
+# blocked on regardless of how browser-like the request looks.
+PROXY_URL = os.environ.get("PROXY_URL") or None
+
+
+def make_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(proxy=PROXY_URL)
 
 BROWSER_HEADERS = {
     "User-Agent": (

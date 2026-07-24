@@ -7,13 +7,12 @@ import time
 from datetime import datetime
 from functools import wraps
 
-import httpx
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import storage
-from ig_checker import check_instagram_status, warm_up_client
+from ig_checker import check_instagram_status, make_client, warm_up_client
 
 BOT_COMMANDS = [
     BotCommand("watch", "Track one or more Instagram accounts"),
@@ -144,7 +143,7 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usernames = [clean_username(u) for u in context.args[:MAX_WATCH_PER_MESSAGE]]
     chat_id = update.effective_chat.id
 
-    async with httpx.AsyncClient() as client:
+    async with make_client() as client:
         await warm_up_client(client)
         for username in usernames:
             result = await check_instagram_status(username, client)
@@ -171,7 +170,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     username = clean_username(context.args[0])
 
-    async with httpx.AsyncClient() as client:
+    async with make_client() as client:
         await warm_up_client(client)
         result = await check_instagram_status(username, client)
 
@@ -287,7 +286,7 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"Unmuted @{username}")
     elif action == "check":
         await query.answer("Checking...")
-        async with httpx.AsyncClient() as client:
+        async with make_client() as client:
             await warm_up_client(client)
             result = await check_instagram_status(username, client)
         if result.status is not None:
@@ -358,7 +357,7 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
 
     consecutive_blocks = 0
 
-    async with httpx.AsyncClient() as client:
+    async with make_client() as client:
         await warm_up_client(client)
         for username in usernames:
             result = await check_instagram_status(username, client)
