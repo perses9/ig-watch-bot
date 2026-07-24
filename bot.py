@@ -69,6 +69,13 @@ MAX_WATCH_PER_MESSAGE = 10
 # wasteful, especially through a metered proxy - reuse one warm client and
 # only refresh its cookies this often instead of every check cycle.
 COOKIE_REFRESH_SECONDS = 1800
+# The cheap header-only check rests on Instagram answering 404 for accounts
+# that are gone. If that ever stops holding, a ban would go unnoticed
+# indefinitely, so force a full page check this often regardless of what the
+# headers say. Bounds the blind spot to this interval at a cost of roughly
+# one page per account per period.
+FULL_CHECK_SECONDS = int(os.environ.get("FULL_CHECK_SECONDS", "1800"))
+_last_full_check = {}
 
 START_TIME = time.monotonic()
 CHECKS_RUN = 0
@@ -473,6 +480,9 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  exit IP unknown: <code>{proxy['exit_ip_error']}</code>")
     for report in reports:
         lines.append(f"\n<b>{report['persona']}</b>")
+        if report.get("head_verdict") is not None:
+            lines.append(f"  verdict: <code>{html.escape(str(report['head_verdict']))}</code>")
+            continue
         if report.get("error"):
             lines.append(f"  request failed: <code>{report['error']}</code>")
             continue
@@ -731,6 +741,14 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
         # Pass what we already know so an unchanged account can be confirmed
         # from headers alone instead of pulling the whole page every minute.
         known = storage.get_state(username)["confirmed_status"]
+
+        # ...but periodically verify properly anyway, so the cheap path can't
+        # quietly hide a change if Instagram's 404 behaviour ever shifts.
+        last_full = _last_full_check.get(username)
+        if last_full is None or time.monotonic() - last_full > FULL_CHECK_SECONDS:
+            known = None
+            _last_full_check[username] = time.monotonic()
+
         result = await check_instagram_status(username, client, known_status=known)
         CHECKS_RUN += 1
         await apply_check_result(context, username, result)

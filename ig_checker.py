@@ -424,6 +424,17 @@ async def diagnose(username: str, client: AsyncSession) -> list:
     """
     reports = []
 
+    # Report the HEAD probe separately: the cheap path depends on Instagram
+    # answering 404 here for missing accounts, and that's worth being able
+    # to confirm rather than assume.
+    probe = await _probe_exists(username, client)
+    reports.append(
+        {
+            "persona": "HEAD probe",
+            "head_verdict": probe.status or probe.error,
+        }
+    )
+
     for label, headers in (("browser", _doc_headers()), ("crawler", _crawler_headers())):
         report = {"persona": label}
         try:
