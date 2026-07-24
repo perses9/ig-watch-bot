@@ -7,11 +7,22 @@ from datetime import datetime
 from functools import wraps
 
 import httpx
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import storage
 from ig_checker import check_instagram_status
+
+BOT_COMMANDS = [
+    BotCommand("watch", "Track one or more Instagram accounts"),
+    BotCommand("check", "Check a username's status right now"),
+    BotCommand("list", "Show tracked accounts, status, and mute state"),
+    BotCommand("remove", "Stop tracking an account"),
+    BotCommand("pause", "Mute notifications for an account"),
+    BotCommand("resume", "Unmute a paused account"),
+    BotCommand("uptime", "Show bot uptime and check count"),
+    BotCommand("help", "Show usage"),
+]
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "15"))
@@ -281,12 +292,16 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
             await notify_watchers(context, username, confirmed, result.status)
 
 
+async def register_commands(application: Application):
+    await application.bot.set_my_commands(BOT_COMMANDS)
+
+
 def main():
     storage.init_db()
     # Python 3.14 removed asyncio.get_event_loop()'s implicit loop creation, which
     # python-telegram-bot's run_polling() still relies on. Set one explicitly.
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(register_commands).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
