@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import random
@@ -7,8 +8,9 @@ from datetime import datetime
 from functools import wraps
 
 import httpx
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import storage
 from ig_checker import check_instagram_status
@@ -39,29 +41,28 @@ START_TIME = time.monotonic()
 CHECKS_RUN = 0
 
 STATUS_LABELS = {
-    "live": "🟢 live",
-    "not_found": "🔴 not found / suspended / deactivated",
-    "unknown": "⚠️ unknown (no confirmed check yet)",
+    "live": "🟢 <b>Live</b>",
+    "not_found": "🔴 <b>Down</b> (suspended, banned, or deactivated)",
+    "unknown": "⚪️ <b>Unknown</b> (no confirmed check yet)",
 }
 
 HELP_TEXT = (
-    "Instagram availability watcher\n\n"
-    "/watch <username> [username2 ...] - start tracking one or more accounts\n"
-    "/check <username> - check status right now, instead of waiting for the next cycle\n"
-    "/list - show tracked accounts, status, and follower counts\n"
-    "/remove <username> - stop tracking an account\n"
-    "/pause <username> - mute notifications for an account without removing it\n"
-    "/resume <username> - unmute a paused account\n"
-    "/uptime - show how long the bot has been running and how many checks it's done\n"
-    "/help - show this message\n\n"
-    f"Accounts are rechecked every {CHECK_INTERVAL_SECONDS}s. "
-    "A status change is only announced after it's confirmed on "
-    f"{CONFIRM_CHECKS} checks in a row, to avoid false alarms from temporary blocks."
+    "👁️ <b>Instagram Watcher</b>\n"
+    "Tracks Instagram accounts and pings you the moment their status changes.\n\n"
+    "<b>Commands</b>\n"
+    "/watch <code>user1 user2 ...</code> — start tracking one or more accounts\n"
+    "/check <code>user</code> — check status right now, no waiting\n"
+    "/list — see everything you're tracking, with quick-action buttons\n"
+    "/remove <code>user</code> — stop tracking an account\n"
+    "/pause <code>user</code> / /resume <code>user</code> — mute or unmute alerts\n"
+    "/uptime — bot health and stats\n\n"
+    f"⏱ Rechecked every <b>{CHECK_INTERVAL_SECONDS}s</b>. A change is only announced after "
+    f"<b>{CONFIRM_CHECKS}</b> checks in a row agree, to avoid false alarms."
 )
 
 
 def fmt(username: str) -> str:
-    return f"@{username}"
+    return f"<code>@{html.escape(username)}</code>"
 
 
 def clean_username(raw: str) -> str:
@@ -88,19 +89,33 @@ def format_duration(seconds: float) -> str:
 def profile_summary(state: dict) -> str:
     bits = []
     if state.get("full_name"):
-        bits.append(state["full_name"])
+        bits.append(html.escape(state["full_name"]))
     if state.get("follower_count") is not None:
         bits.append(f"{state['follower_count']:,} followers")
     if state.get("is_private"):
         bits.append("private")
-    return f" ({', '.join(bits)})" if bits else ""
+    return f"\n<i>{' · '.join(bits)}</i>" if bits else ""
+
+
+def watch_keyboard(username: str, paused: bool) -> InlineKeyboardMarkup:
+    mute_button = (
+        InlineKeyboardButton("🔊 Unmute", callback_data=f"resume:{username}")
+        if paused
+        else InlineKeyboardButton("🔇 Mute", callback_data=f"pause:{username}")
+    )
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔍 Check now", callback_data=f"check:{username}"), mute_button],
+            [InlineKeyboardButton("🗑 Remove", callback_data=f"remove:{username}")],
+        ]
+    )
 
 
 def restricted(handler):
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS:
-            await update.message.reply_text("You're not authorized to use this bot.")
+            await update.effective_message.reply_text("You're not authorized to use this bot.")
             return
         return await handler(update, context)
 
@@ -109,12 +124,15 @@ def restricted(handler):
 
 @restricted
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(
+        HELP_TEXT + "\n\n👇 Try <code>/watch instagram</code> to see it in action.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @restricted
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
 @restricted
@@ -125,19 +143,24 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     usernames = [clean_username(u) for u in context.args[:MAX_WATCH_PER_MESSAGE]]
     chat_id = update.effective_chat.id
-    lines = []
 
     async with httpx.AsyncClient() as client:
         for username in usernames:
             result = await check_instagram_status(username, client)
             if result.status is None:
-                lines.append(f"⚠️ {fmt(username)}: couldn't verify right now ({result.error})")
+                await update.message.reply_text(
+                    f"⚠️ Couldn't verify {fmt(username)} right now ({result.error}).",
+                    parse_mode=ParseMode.HTML,
+                )
                 continue
             storage.add_watch(chat_id, username)
             storage.set_confirmed(username, result.status, vars(result))
-            lines.append(f"✅ {fmt(username)}: {STATUS_LABELS[result.status]}")
-
-    await update.message.reply_text("\n".join(lines))
+            state = storage.get_state(username)
+            await update.message.reply_text(
+                f"✅ Now tracking {fmt(username)}\n{STATUS_LABELS[result.status]}{profile_summary(state)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=watch_keyboard(username, paused=False),
+            )
 
 
 @restricted
@@ -152,14 +175,16 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result.status is None:
         await update.message.reply_text(
-            f"⚠️ Couldn't verify {fmt(username)} right now ({result.error}). Try again in a moment."
+            f"⚠️ Couldn't verify {fmt(username)} right now ({result.error}). Try again in a moment.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     summary = profile_summary(vars(result))
     await update.message.reply_text(
-        f"{fmt(username)}: {STATUS_LABELS[result.status]}{summary}\n"
-        "(This is a one-off check and doesn't affect anything you're tracking.)"
+        f"{fmt(username)}\n{STATUS_LABELS[result.status]}{summary}\n\n"
+        "<i>One-off check — doesn't affect your tracked list.</i>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -171,9 +196,9 @@ async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = clean_username(context.args[0])
     chat_id = update.effective_chat.id
     if storage.remove_watch(chat_id, username):
-        await update.message.reply_text(f"🗑️ Stopped tracking {fmt(username)}.")
+        await update.message.reply_text(f"🗑 Stopped tracking {fmt(username)}.", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"You weren't tracking {fmt(username)}.")
+        await update.message.reply_text(f"You weren't tracking {fmt(username)}.", parse_mode=ParseMode.HTML)
 
 
 @restricted
@@ -184,9 +209,9 @@ async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = clean_username(context.args[0])
     chat_id = update.effective_chat.id
     if storage.set_paused(chat_id, username, True):
-        await update.message.reply_text(f"🔇 Muted notifications for {fmt(username)} (still tracked).")
+        await update.message.reply_text(f"🔇 Muted {fmt(username)} (still tracked).", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"You weren't tracking {fmt(username)}.")
+        await update.message.reply_text(f"You weren't tracking {fmt(username)}.", parse_mode=ParseMode.HTML)
 
 
 @restricted
@@ -197,9 +222,9 @@ async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = clean_username(context.args[0])
     chat_id = update.effective_chat.id
     if storage.set_paused(chat_id, username, False):
-        await update.message.reply_text(f"🔊 Unmuted {fmt(username)}.")
+        await update.message.reply_text(f"🔊 Unmuted {fmt(username)}.", parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"You weren't tracking {fmt(username)}.")
+        await update.message.reply_text(f"You weren't tracking {fmt(username)}.", parse_mode=ParseMode.HTML)
 
 
 @restricted
@@ -211,24 +236,72 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "You're not tracking any accounts yet. Use /watch <username> to add one."
         )
         return
-    lines = ["Tracking:"]
+
+    await update.message.reply_text(f"👁 <b>Tracking {len(watches)} account(s)</b>", parse_mode=ParseMode.HTML)
     for w in watches:
         state = storage.get_state(w["username"])
         status = state["confirmed_status"] or "unknown"
-        mute_tag = " 🔇" if w["paused"] else ""
-        lines.append(
-            f"{fmt(w['username'])}: {STATUS_LABELS.get(status, status)}{profile_summary(state)}{mute_tag}"
+        mute_tag = " · 🔇 muted" if w["paused"] else ""
+        await update.message.reply_text(
+            f"{fmt(w['username'])}\n{STATUS_LABELS.get(status, status)}{profile_summary(state)}{mute_tag}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=watch_keyboard(w["username"], paused=w["paused"]),
         )
-    await update.message.reply_text("\n".join(lines))
 
 
 @restricted
 async def uptime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elapsed = time.monotonic() - START_TIME
     await update.message.reply_text(
-        f"Bot has been running for {format_duration(elapsed)}.\n"
+        f"🤖 <b>Bot status</b>\n"
+        f"Uptime: {format_duration(elapsed)}\n"
         f"Checks run this session: {CHECKS_RUN}\n"
-        f"Check interval: {CHECK_INTERVAL_SECONDS}s"
+        f"Check interval: {CHECK_INTERVAL_SECONDS}s",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+
+    if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    action, _, username = query.data.partition(":")
+
+    if action == "remove":
+        storage.remove_watch(chat_id, username)
+        await query.answer(f"Removed @{username}")
+        await query.edit_message_text(f"🗑 Stopped tracking {fmt(username)}.", parse_mode=ParseMode.HTML)
+        return
+
+    if action == "pause":
+        storage.set_paused(chat_id, username, True)
+        await query.answer(f"Muted @{username}")
+    elif action == "resume":
+        storage.set_paused(chat_id, username, False)
+        await query.answer(f"Unmuted @{username}")
+    elif action == "check":
+        await query.answer("Checking...")
+        async with httpx.AsyncClient() as client:
+            result = await check_instagram_status(username, client)
+        if result.status is not None:
+            storage.set_confirmed(username, result.status, vars(result))
+    else:
+        await query.answer()
+        return
+
+    state = storage.get_state(username)
+    status = state["confirmed_status"] or "unknown"
+    watches = storage.list_watches(chat_id)
+    paused = next((w["paused"] for w in watches if w["username"] == username), False)
+    mute_tag = " · 🔇 muted" if paused else ""
+    await query.edit_message_text(
+        f"{fmt(username)}\n{STATUS_LABELS.get(status, status)}{profile_summary(state)}{mute_tag}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=watch_keyboard(username, paused=paused),
     )
 
 
@@ -242,21 +315,34 @@ async def notify_watchers(context: ContextTypes.DEFAULT_TYPE, username: str, old
             try:
                 down_since = datetime.fromisoformat(state["down_since"])
                 downtime_seconds = (datetime.utcnow() - down_since).total_seconds()
-                downtime = f" (was down for {format_duration(downtime_seconds)})"
+                downtime = f" after {format_duration(downtime_seconds)}"
             except ValueError:
                 pass
-        text = f"🚨 {fmt(username)} is BACK ONLINE!{downtime}{summary}\n\nhttps://instagram.com/{username}"
+        text = (
+            f"🚨 <b>{fmt(username)} is BACK ONLINE</b>{downtime}!{summary}\n\n"
+            f"https://instagram.com/{username}"
+        )
     elif new_status == "not_found":
-        text = f"⚠️ {fmt(username)} is no longer reachable (banned, suspended, or deactivated)."
+        text = f"⚠️ {fmt(username)} <b>is no longer reachable</b> (banned, suspended, or deactivated).{summary}"
     else:
         text = f"ℹ️ {fmt(username)} status changed to {STATUS_LABELS.get(new_status, new_status)}{summary}"
+
+    keyboard = watch_keyboard(username, paused=False)
 
     for chat_id in storage.chats_watching(username, only_unpaused=True):
         try:
             if new_status == "live" and state.get("profile_pic_url"):
-                await context.bot.send_photo(chat_id=chat_id, photo=state["profile_pic_url"], caption=text)
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=state["profile_pic_url"],
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
             else:
-                await context.bot.send_message(chat_id=chat_id, text=text)
+                await context.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+                )
         except Exception:
             logger.exception("failed to notify chat %s about %s", chat_id, username)
 
@@ -329,6 +415,7 @@ def main():
     app.add_handler(CommandHandler("resume", resume_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("uptime", uptime_cmd))
+    app.add_handler(CallbackQueryHandler(button_cmd))
 
     app.job_queue.run_repeating(check_job, interval=CHECK_INTERVAL_SECONDS, first=10)
 
