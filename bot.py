@@ -267,11 +267,28 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
     if not usernames:
         return
 
+    consecutive_blocks = 0
+
     async with httpx.AsyncClient() as client:
         for username in usernames:
             result = await check_instagram_status(username, client)
             CHECKS_RUN += 1
-            await asyncio.sleep(random.uniform(1, 3))  # spread requests out, avoid bursty IP blocks
+
+            if result.error == "rate_limited":
+                consecutive_blocks += 1
+                # Back off harder the more blocks we see in a row, instead of
+                # keeping up the same pace and getting blocked even longer.
+                backoff = min(60, 5 * (2 ** consecutive_blocks))
+                logger.warning(
+                    "%s: rate limited (%d in a row), backing off %ds", username, consecutive_blocks, backoff
+                )
+                await asyncio.sleep(backoff)
+                if consecutive_blocks >= 3:
+                    logger.warning("too many consecutive blocks, skipping rest of this cycle")
+                    break
+            else:
+                consecutive_blocks = 0
+                await asyncio.sleep(random.uniform(1, 3))  # spread requests out, avoid bursty IP blocks
 
             if result.status is None:
                 logger.info("%s: temporary check issue (%s) — keeping last confirmed status", username, result.error)

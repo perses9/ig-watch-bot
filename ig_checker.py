@@ -4,14 +4,28 @@ from typing import Optional
 import httpx
 
 APP_ID = "936619743392459"  # public X-IG-App-ID used by instagram.com's own web client
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    ),
-    "X-IG-App-ID": APP_ID,
-    "Accept": "application/json",
-}
+
+
+def _headers(username: str) -> dict:
+    # Mirrors what a logged-out Chrome browser actually sends when it loads a
+    # profile page — same headers, same www.instagram.com host, real referer.
+    # The stripped-down mobile-API-style request (i.instagram.com, minimal
+    # headers) gets flagged as automated much faster than this does.
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-IG-App-ID": APP_ID,
+        "X-Requested-With": "XMLHttpRequest",
+        "X-ASBD-ID": "129477",
+        "Referer": f"https://www.instagram.com/{username}/",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+    }
 
 
 @dataclass
@@ -26,9 +40,9 @@ class CheckResult:
 
 
 async def check_instagram_status(username: str, client: httpx.AsyncClient) -> CheckResult:
-    url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     try:
-        resp = await client.get(url, headers=HEADERS, timeout=10, follow_redirects=True)
+        resp = await client.get(url, headers=_headers(username), timeout=10, follow_redirects=True)
     except httpx.HTTPError as exc:
         return CheckResult(status=None, error=type(exc).__name__)
 
