@@ -11,7 +11,7 @@ import storage
 from ig_checker import check_instagram_status
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "30"))
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "15"))
 CONFIRM_CHECKS = int(os.environ.get("CONFIRM_CHECKS", "2"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

@@ -53,22 +53,56 @@ from not-found back to live, everyone tracking it gets pinged immediately.
 The bot uses long polling, so it just needs outbound internet — no public
 URL or webhook needed.
 
-## Running it 24/7
+## Running it 24/7 (VPS, recommended for tight polling)
 
-You need something that keeps the process alive continuously. Options,
-cheapest/simplest first:
+A small always-on VPS (Hetzner CX22 ~€4/mo, DigitalOcean basic droplet
+~$6/mo) is the best fit if you want a short poll interval: flat-rate
+pricing regardless of how often you poll, no cold starts, and full control
+if you later add proxy rotation to poll faster. Ubuntu 22.04/24.04 steps:
 
-- **Railway / Render (recommended)**: connect this GitHub repo, set
-  `BOT_TOKEN` as an env var, deploy as a "worker" (uses the included
-  `Procfile`). No server maintenance. Add a persistent volume mounted at the
-  working directory if you want the watchlist (`watchlist.db`) to survive
-  redeploys — otherwise it resets to empty on each deploy but survives
-  normal restarts.
-- **Any small VPS** (e.g. a $4-6/mo droplet): clone the repo, `pip install
-  -r requirements.txt`, run under `systemd` or `pm2` so it restarts on crash
-  and on boot.
-- **Docker anywhere**: `docker build -t ig-watch-bot . && docker run -d
-  --env-file .env -v $(pwd)/data:/app ig-watch-bot`
+```bash
+# on the VPS, as root
+apt update && apt install -y python3-venv git
+useradd --system --create-home --shell /usr/sbin/nologin igwatch
+
+git clone <your-repo-url> /opt/ig-watch-bot
+cd /opt/ig-watch-bot
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+
+cp .env.example .env
+nano .env               # fill in BOT_TOKEN, adjust CHECK_INTERVAL_SECONDS
+chown -R igwatch:igwatch /opt/ig-watch-bot
+
+cp deploy/ig-watch-bot.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now ig-watch-bot
+
+# check it's running / watch logs live
+systemctl status ig-watch-bot
+journalctl -u ig-watch-bot -f
+```
+
+`Restart=on-failure` in the unit file means it comes back up if it crashes,
+and `enable` means it starts automatically on VPS reboot. To deploy an
+update later: `git pull`, `./venv/bin/pip install -r requirements.txt` (if
+deps changed), `systemctl restart ig-watch-bot`.
+
+## Alternative: Railway / Render (less ops, worse fit for frequent polling)
+
+Connect this GitHub repo, set `BOT_TOKEN` as an env var, deploy as a
+"worker" (uses the included `Procfile`). Zero server maintenance, but
+usage-based billing scales worse the more aggressively you poll, and some
+tiers sleep idle workers. Add a persistent volume mounted at the working
+directory if you want the watchlist (`watchlist.db`) to survive redeploys —
+otherwise it resets to empty on each deploy but survives normal restarts.
+
+## Docker (either host)
+
+```bash
+docker build -t ig-watch-bot .
+docker run -d --env-file .env -v $(pwd)/data:/app ig-watch-bot
+```
 
 ## Rate-limit note
 
@@ -85,7 +119,7 @@ through a proxy.
 | Variable                | Default          | Meaning                                   |
 |--------------------------|------------------|--------------------------------------------|
 | `BOT_TOKEN`              | *required*       | Telegram bot token from BotFather          |
-| `CHECK_INTERVAL_SECONDS` | `30`             | How often every watched account is rechecked |
+| `CHECK_INTERVAL_SECONDS` | `15`             | How often every watched account is rechecked |
 | `CONFIRM_CHECKS`         | `2`              | Consecutive matching checks needed before announcing a status change |
 | `DB_PATH`                | `watchlist.db`   | SQLite file storing watchlists + status    |
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Instagram watch Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=igwatch
+Group=igwatch
+WorkingDirectory=/opt/ig-watch-bot
+EnvironmentFile=/opt/ig-watch-bot/.env
+ExecStart=/opt/ig-watch-bot/venv/bin/python /opt/ig-watch-bot/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
