@@ -529,9 +529,18 @@ def test_rate_limit_is_not_masked():
 
 
 class _WalledThenThrottled(BaseHTTPRequestHandler):
-    """Browser attempt hits a login wall; the crawler attempt is throttled."""
+    """API wants a login, the browser attempt hits a wall, and the crawler
+    attempt is throttled — so the rate limit is the last thing seen."""
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def do_GET(self):
+        if "/api/v1/" in self.path:
+            self.send_response(401)
+            self.end_headers()
+            return
         self.server.hits.append(self.path)
         if "facebookexternalhit" in self.headers.get("User-Agent", ""):
             self.send_response(429)
@@ -639,11 +648,18 @@ def test_app_shell_end_to_end():
 
 
 class _CountingServer(BaseHTTPRequestHandler):
+    """Mimics what the live site actually does: the JSON API answers
+    definitively, while the page is a 600KB shell carrying no profile data."""
+
     protocol_version = "HTTP/1.1"
-    BIG_PAGE = (
-        '<html><head><title>Instagram</title></head><body>' + "x" * 300000
-        + '<script>{"user":{"username":"backup","full_name":"Is Back",'
-          '"edge_followed_by":{"count":900}}}</script></body></html>'
+    SHELL = (
+        '<html><head><title>Instagram</title></head><body>'
+        '<style>:root{--fds-black:#000}</style>' + "x" * 200000 + "</body></html>"
+    ).encode()
+    LIVE_JSON = (
+        '{"data":{"user":{"username":"liveone","full_name":"Live One",'
+        '"is_private":false,"edge_followed_by":{"count":12345},'
+        '"profile_pic_url_hd":"https://cdn.example/p.jpg"}}}'
     ).encode()
 
     def _respond(self, code, body=b""):
@@ -654,21 +670,29 @@ class _CountingServer(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_HEAD(self):
-        path = self.path.split("?")[0].strip("/")
-        self.server.calls.append(("HEAD", path))
-        self._respond(404 if path == "banned" else 200)
+        self.server.calls.append(("HEAD", self.path.split("?")[0]))
+        self._respond(200)
 
     def do_GET(self):
-        path = self.path.split("?")[0].strip("/")
+        path = self.path.split("?")[0]
         self.server.calls.append(("GET", path))
-        self._respond(200, self.BIG_PAGE)
+        if "/api/v1/" in path:
+            account = self.path.split("username=")[-1]
+            if account == "banned":
+                self._respond(404, b"{}")
+            elif account == "liveone":
+                self._respond(200, self.LIVE_JSON)
+            else:  # the API sometimes demands a login
+                self._respond(401, b"{}")
+        else:
+            self._respond(200, self.SHELL)
 
     def log_message(self, *args):
         pass
 
 
-def test_bandwidth_shortcuts():
-    print("\nproxy data is only spent when something might have changed")
+def test_api_first_is_cheap_and_definitive():
+    print("\nthe API answers first, so checks stay small")
     HTTPServer.allow_reuse_address = True
     server = HTTPServer(("127.0.0.1", 0), _CountingServer)
     server.calls = []
@@ -678,39 +702,35 @@ def test_bandwidth_shortcuts():
     async def run():
         client = ic.make_client()
         try:
-            # Still banned: headers alone answer it.
             server.calls.clear()
             before = ic.bytes_used()
-            result = await ic.check_instagram_status("banned", client, known_status="not_found")
+            result = await ic.check_instagram_status("banned", client)
             spent = ic.bytes_used() - before
-            check("a still-banned account is detected", result.status == "not_found")
-            check("without downloading the page", not any(c[0] == "GET" for c in server.calls),
-                  f"made {server.calls}")
-            check("costing well under 5KB", spent < 5000, f"used {spent} bytes")
-
-            # Still live: also headers alone.
-            server.calls.clear()
-            before = ic.bytes_used()
-            result = await ic.check_instagram_status("stillup", client, known_status="live")
-            spent = ic.bytes_used() - before
-            check("a still-live account stays live", result.status == "live")
-            check("also without downloading the page", not any(c[0] == "GET" for c in server.calls),
-                  f"made {server.calls}")
-            check("also costing well under 5KB", spent < 5000, f"used {spent} bytes")
-
-            # Recovery: this one is worth paying for.
-            server.calls.clear()
-            result = await ic.check_instagram_status("backup", client, known_status="not_found")
-            check("a recovered account is detected", result.status == "live",
+            check("a banned account is detected", result.status == "not_found",
                   f"got {result.status or result.error}")
-            check("its details are fetched", result.follower_count == 900, f"got {result.follower_count}")
-            check("which does require the full page", any(c[0] == "GET" for c in server.calls))
+            check("in a single request", len(server.calls) == 1, f"made {server.calls}")
+            check("without touching the 600KB page",
+                  not any("api" not in c[1] for c in server.calls), f"made {server.calls}")
+            check("costing under 5KB", spent < 5000, f"used {spent:,} bytes")
 
-            # Discovery with nothing known: must not shortcut.
             server.calls.clear()
-            await ic.check_instagram_status("unknownacct", client, known_status=None)
-            check("a brand-new account is checked properly, not assumed live",
-                  any(c[0] == "GET" for c in server.calls), f"made {server.calls}")
+            before = ic.bytes_used()
+            result = await ic.check_instagram_status("liveone", client)
+            spent = ic.bytes_used() - before
+            check("a live account is detected", result.status == "live",
+                  f"got {result.status or result.error}")
+            check("with its profile details", result.follower_count == 12345 and result.full_name == "Live One",
+                  f"got {result.full_name!r}/{result.follower_count}")
+            check("also in a single request", len(server.calls) == 1, f"made {server.calls}")
+            check("also under 5KB", spent < 5000, f"used {spent:,} bytes")
+
+            # When the API demands a login, the page fallback still runs.
+            server.calls.clear()
+            result = await ic.check_instagram_status("walled", client)
+            check("a 401 from the API falls back to the page",
+                  any("api" not in c[1] for c in server.calls), f"made {server.calls}")
+            check("and reports honestly when the page has nothing",
+                  result.status is None, f"got {result.status!r}")
         finally:
             await client.close()
             server.shutdown()
@@ -817,7 +837,7 @@ def main():
         test_embedded_json_parsing,
         test_not_found_apostrophe_variants,
         test_app_shell_end_to_end,
-        test_bandwidth_shortcuts,
+        test_api_first_is_cheap_and_definitive,
         test_owner_fallback_order,
         test_env_users_occupy_slots,
         test_application_assembles,

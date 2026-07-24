@@ -363,14 +363,21 @@ async def _check_via_html(username: str, client: AsyncSession) -> CheckResult:
 
 
 async def _check_via_api(username: str, client: AsyncSession) -> CheckResult:
-    """Fallback: the JSON API. Richer data (private flag, exact follower count)
-    when it works, but it now returns 401 without a logged-in session."""
+    """The JSON API — primary check.
+
+    Answers 404 for accounts that are suspended, deactivated, or gone, and
+    returns the full profile when they're live. Sometimes 401s and wants a
+    login, which is why the page fallback still exists, but when it does
+    answer it's both definitive and far smaller than the 600KB page."""
     url = f"{BASE_URL}/api/v1/users/web_profile_info/?username={username}"
     csrftoken = client.cookies.get("csrftoken")
     try:
         resp = await client.get(url, headers=_api_headers(username, csrftoken), timeout=15, allow_redirects=True)
     except RequestException as exc:
         return CheckResult(status=None, error=type(exc).__name__)
+
+    body = resp.text or ""
+    _count_bytes(len(body))
 
     if resp.status_code == 200:
         try:
@@ -477,32 +484,25 @@ async def diagnose(username: str, client: AsyncSession) -> list:
 async def check_instagram_status(
     username: str, client: AsyncSession, known_status: Optional[str] = None
 ) -> CheckResult:
-    """known_status is what we already believe about this account. Passing it
-    lets an unchanged account be confirmed from headers alone; leave it None
-    to force a full check when the details actually matter."""
-    # Cheap first: a HEAD request settles the common case (still banned) for a
-    # few hundred bytes instead of ~600KB.
-    probe = await _probe_exists(username, client)
-    if probe.status == "not_found":
-        return probe
-    if probe.error == "rate_limited":
-        return probe
+    """known_status is unused now, kept so callers don't need changing.
 
-    # Not a 404. If we already had it down as live, that's consistent with
-    # what we knew, and nothing needs announcing - so skip the page entirely.
-    # Note the asymmetry: a 404 disproves "live", but a 200 doesn't prove it,
-    # since Instagram serves an empty shell for missing accounts too. That's
-    # why this shortcut only applies when we're confirming, never discovering.
-    if known_status == "live":
-        return CheckResult(status="live")
+    The JSON API goes first. Diagnostics against the live site showed it
+    answering definitively (404 for an account that's gone) in exactly the
+    situation where the page was useless: a 600KB shell carrying no profile
+    data at all, and a HEAD request returning 200 for an account that was
+    actually suspended. It's also a fraction of the size, so the accurate
+    path is the cheap one.
+    """
+    api_result = await _check_via_api(username, client)
+    if api_result.status is not None:
+        return api_result
+    if api_result.error == "rate_limited":
+        return api_result
 
-    # Not a 404, so the account may be back — now it's worth the full page.
-    #
-    # Retry when the answer is inconclusive: the proxy hands out a different
-    # residential IP per request, and Instagram serves the data-bearing page
-    # to some IPs and a bare app shell to others, so a second attempt is a
-    # genuinely different roll rather than a repeat of the same one.
-    last = None
+    # The API answers 401 when it wants a login, which happens on some exit
+    # IPs. Fall back to the page, retrying once - each request leaves through
+    # a different residential IP, so it's a fresh roll rather than a repeat.
+    last = api_result
     for attempt in range(CHECK_ATTEMPTS):
         result = await _check_via_html(username, client)
         if result.status is not None:
@@ -512,11 +512,5 @@ async def check_instagram_status(
         last = result
         if attempt < CHECK_ATTEMPTS - 1:
             await asyncio.sleep(1)
-
-    # The API is usually gated behind a login now, but it's cheap to ask once
-    # more when everything else came back ambiguous.
-    api_result = await _check_via_api(username, client)
-    if api_result.status is not None:
-        return api_result
 
     return last
