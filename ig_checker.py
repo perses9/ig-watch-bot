@@ -36,9 +36,22 @@ BROWSER_HEADERS = {
 _bytes_used = 0
 
 
-def _count_bytes(n: int) -> None:
+def _count_response(resp) -> None:
+    """Count what crossed the wire, not what we ended up with.
+
+    Responses arrive gzipped, and the decoded text is several times larger
+    than the transfer the proxy actually bills for - counting the decoded
+    length overstates usage badly enough to be misleading.
+    """
     global _bytes_used
-    _bytes_used += max(0, n)
+    declared = resp.headers.get("content-length")
+    if declared and declared.isdigit():
+        _bytes_used += int(declared)
+    else:
+        # No Content-Length (chunked): fall back to the decoded body with a
+        # rough compression factor, since that's the best estimate available.
+        _bytes_used += len(resp.text or "") // 4
+    _bytes_used += 400  # request headers, TLS handshake, protocol overhead
 
 
 def bytes_used() -> int:
@@ -151,7 +164,8 @@ async def warm_up_client(client: AsyncSession) -> None:
     same as what happens before any real browser ever calls a profile page.
     Failures here are non-fatal — the checks still work without cookies."""
     try:
-        await client.get(f"{BASE_URL}/", headers=BROWSER_HEADERS, timeout=15)
+        resp = await client.get(f"{BASE_URL}/", headers=BROWSER_HEADERS, timeout=15)
+        _count_response(resp)
     except RequestException:
         pass
 
@@ -271,7 +285,7 @@ async def _probe_exists(username: str, client: AsyncSession) -> CheckResult:
     except RequestException as exc:
         return CheckResult(status=None, error=type(exc).__name__)
 
-    _count_bytes(len(str(resp.headers)) + 200)  # headers plus protocol overhead
+    _count_response(resp)
 
     if resp.status_code == 404:
         return CheckResult(status="not_found")
@@ -307,7 +321,7 @@ async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict
         return CheckResult(status=None, error=f"http_{resp.status_code}")
 
     page = resp.text or ""
-    _count_bytes(len(page))
+    _count_response(resp)
 
     if any(marker in page for marker in NOT_FOUND_MARKERS):
         return CheckResult(status="not_found")
@@ -376,8 +390,7 @@ async def _check_via_api(username: str, client: AsyncSession) -> CheckResult:
     except RequestException as exc:
         return CheckResult(status=None, error=type(exc).__name__)
 
-    body = resp.text or ""
-    _count_bytes(len(body))
+    _count_response(resp)
 
     if resp.status_code == 200:
         try:
