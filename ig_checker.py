@@ -1,3 +1,4 @@
+import asyncio
 import html
 import json
 import os
@@ -20,9 +21,28 @@ PROXY_URL = os.environ.get("PROXY_URL") or None
 # instead of exercising a copy of the logic.
 BASE_URL = "https://www.instagram.com"
 
+# How many times to re-request the page when the answer is ambiguous.
+# Each attempt goes out through a different proxy IP, so retrying is a
+# fresh chance rather than the same request twice.
+CHECK_ATTEMPTS = int(os.environ.get("CHECK_ATTEMPTS", "2"))
+
 BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# Residential proxies bill by the gigabyte, so track roughly how much this
+# bot is pulling. Surfaced by /uptime to make the burn rate visible before
+# it shows up as an empty balance.
+_bytes_used = 0
+
+
+def _count_bytes(n: int) -> None:
+    global _bytes_used
+    _bytes_used += max(0, n)
+
+
+def bytes_used() -> int:
+    return _bytes_used
 
 # Text Instagram serves on the "this account doesn't exist" page. Checked
 # against the HTML body when the page returns 200 instead of a clean 404.
@@ -228,6 +248,38 @@ def _parse_embedded_json(page: str, username: str) -> Optional[dict]:
     return profile
 
 
+async def _probe_exists(username: str, client: AsyncSession) -> CheckResult:
+    """Ask only for the headers, not the page.
+
+    The full profile page is ~600KB, and a metered residential proxy charges
+    by the gigabyte — polling one account every 15 seconds would run to
+    gigabytes a day. A HEAD request costs a fraction of that and still
+    carries the status code, which is the signal that matters: Instagram
+    answers 404 for accounts that are suspended, deactivated, or gone.
+
+    That's the common case for this bot, since the whole point is watching a
+    banned account until it returns. Only once the answer stops being 404 do
+    we spend the bandwidth on the real page.
+
+    status="not_found" is a definitive answer; anything else means "keep
+    looking" rather than "it's live".
+    """
+    try:
+        resp = await client.head(
+            f"{BASE_URL}/{username}/?hl=en", headers=_doc_headers(), timeout=15, allow_redirects=False
+        )
+    except RequestException as exc:
+        return CheckResult(status=None, error=type(exc).__name__)
+
+    _count_bytes(len(str(resp.headers)) + 200)  # headers plus protocol overhead
+
+    if resp.status_code == 404:
+        return CheckResult(status="not_found")
+    if resp.status_code == 429:
+        return CheckResult(status=None, error="rate_limited")
+    return CheckResult(status=None, error=f"head_{resp.status_code}")
+
+
 async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict) -> CheckResult:
     """One attempt at the public profile page. hl=en pins the response language:
     the proxy hands out IPs from random countries, and a localised page would
@@ -255,6 +307,7 @@ async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict
         return CheckResult(status=None, error=f"http_{resp.status_code}")
 
     page = resp.text or ""
+    _count_bytes(len(page))
 
     if any(marker in page for marker in NOT_FOUND_MARKERS):
         return CheckResult(status="not_found")
@@ -410,23 +463,49 @@ async def diagnose(username: str, client: AsyncSession) -> list:
     return reports
 
 
-async def check_instagram_status(username: str, client: AsyncSession) -> CheckResult:
-    result = await _check_via_html(username, client)
-    if result.status is not None:
-        return result
+async def check_instagram_status(
+    username: str, client: AsyncSession, known_status: Optional[str] = None
+) -> CheckResult:
+    """known_status is what we already believe about this account. Passing it
+    lets an unchanged account be confirmed from headers alone; leave it None
+    to force a full check when the details actually matter."""
+    # Cheap first: a HEAD request settles the common case (still banned) for a
+    # few hundred bytes instead of ~600KB.
+    probe = await _probe_exists(username, client)
+    if probe.status == "not_found":
+        return probe
+    if probe.error == "rate_limited":
+        return probe
 
-    # Already throttled: another request would only extend the block, and the
-    # caller needs to see the rate limit to back off.
-    if result.error == "rate_limited":
-        return result
+    # Not a 404. If we already had it down as live, that's consistent with
+    # what we knew, and nothing needs announcing - so skip the page entirely.
+    # Note the asymmetry: a 404 disproves "live", but a 200 doesn't prove it,
+    # since Instagram serves an empty shell for missing accounts too. That's
+    # why this shortcut only applies when we're confirming, never discovering.
+    if known_status == "live":
+        return CheckResult(status="live")
 
-    # HTML was inconclusive — try the API before giving up. It's often blocked
-    # now, but when it does answer it's the more detailed of the two.
+    # Not a 404, so the account may be back — now it's worth the full page.
+    #
+    # Retry when the answer is inconclusive: the proxy hands out a different
+    # residential IP per request, and Instagram serves the data-bearing page
+    # to some IPs and a bare app shell to others, so a second attempt is a
+    # genuinely different roll rather than a repeat of the same one.
+    last = None
+    for attempt in range(CHECK_ATTEMPTS):
+        result = await _check_via_html(username, client)
+        if result.status is not None:
+            return result
+        if result.error == "rate_limited":
+            return result
+        last = result
+        if attempt < CHECK_ATTEMPTS - 1:
+            await asyncio.sleep(1)
+
+    # The API is usually gated behind a login now, but it's cheap to ask once
+    # more when everything else came back ambiguous.
     api_result = await _check_via_api(username, client)
     if api_result.status is not None:
         return api_result
-    if api_result.error == "rate_limited":
-        return api_result
 
-    # Both inconclusive: report the HTML failure, since that's the primary path.
-    return result
+    return last

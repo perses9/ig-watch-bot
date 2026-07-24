@@ -638,6 +638,86 @@ def test_app_shell_end_to_end():
     asyncio.run(run())
 
 
+class _CountingServer(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    BIG_PAGE = (
+        '<html><head><title>Instagram</title></head><body>' + "x" * 300000
+        + '<script>{"user":{"username":"backup","full_name":"Is Back",'
+          '"edge_followed_by":{"count":900}}}</script></body></html>'
+    ).encode()
+
+    def _respond(self, code, body=b""):
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        path = self.path.split("?")[0].strip("/")
+        self.server.calls.append(("HEAD", path))
+        self._respond(404 if path == "banned" else 200)
+
+    def do_GET(self):
+        path = self.path.split("?")[0].strip("/")
+        self.server.calls.append(("GET", path))
+        self._respond(200, self.BIG_PAGE)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_bandwidth_shortcuts():
+    print("\nproxy data is only spent when something might have changed")
+    HTTPServer.allow_reuse_address = True
+    server = HTTPServer(("127.0.0.1", 0), _CountingServer)
+    server.calls = []
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    ic.BASE_URL = f"http://127.0.0.1:{server.server_port}"
+
+    async def run():
+        client = ic.make_client()
+        try:
+            # Still banned: headers alone answer it.
+            server.calls.clear()
+            before = ic.bytes_used()
+            result = await ic.check_instagram_status("banned", client, known_status="not_found")
+            spent = ic.bytes_used() - before
+            check("a still-banned account is detected", result.status == "not_found")
+            check("without downloading the page", not any(c[0] == "GET" for c in server.calls),
+                  f"made {server.calls}")
+            check("costing well under 5KB", spent < 5000, f"used {spent} bytes")
+
+            # Still live: also headers alone.
+            server.calls.clear()
+            before = ic.bytes_used()
+            result = await ic.check_instagram_status("stillup", client, known_status="live")
+            spent = ic.bytes_used() - before
+            check("a still-live account stays live", result.status == "live")
+            check("also without downloading the page", not any(c[0] == "GET" for c in server.calls),
+                  f"made {server.calls}")
+            check("also costing well under 5KB", spent < 5000, f"used {spent} bytes")
+
+            # Recovery: this one is worth paying for.
+            server.calls.clear()
+            result = await ic.check_instagram_status("backup", client, known_status="not_found")
+            check("a recovered account is detected", result.status == "live",
+                  f"got {result.status or result.error}")
+            check("its details are fetched", result.follower_count == 900, f"got {result.follower_count}")
+            check("which does require the full page", any(c[0] == "GET" for c in server.calls))
+
+            # Discovery with nothing known: must not shortcut.
+            server.calls.clear()
+            await ic.check_instagram_status("unknownacct", client, known_status=None)
+            check("a brand-new account is checked properly, not assumed live",
+                  any(c[0] == "GET" for c in server.calls), f"made {server.calls}")
+        finally:
+            await client.close()
+            server.shutdown()
+
+    asyncio.run(run())
+
+
 def test_owner_fallback_order():
     print("\nowner fallback picks the first listed ID")
     import importlib
@@ -737,6 +817,7 @@ def main():
         test_embedded_json_parsing,
         test_not_found_apostrophe_variants,
         test_app_shell_end_to_end,
+        test_bandwidth_shortcuts,
         test_owner_fallback_order,
         test_env_users_occupy_slots,
         test_application_assembles,

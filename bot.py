@@ -14,6 +14,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 import storage
 from ig_checker import (
+    bytes_used,
     check_instagram_status,
     diagnose,
     make_client,
@@ -37,7 +38,7 @@ BOT_COMMANDS = [
 ]
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "15"))
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "60"))
 CONFIRM_CHECKS = int(os.environ.get("CONFIRM_CHECKS", "2"))
 # Order is preserved: the fallback owner is whoever is listed first, which
 # would be wrong if this were a set - group chat IDs are large negative
@@ -528,13 +529,20 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def uptime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elapsed = time.monotonic() - START_TIME
-    await update.message.reply_text(
-        f"🤖 <b>Bot status</b>\n"
-        f"Uptime: {format_duration(elapsed)}\n"
-        f"Checks run this session: {CHECKS_RUN}\n"
+    used = bytes_used()
+    hours = max(elapsed / 3600, 1 / 60)
+    per_day = used / hours * 24
+
+    lines = [
+        "🤖 <b>Bot status</b>",
+        f"Uptime: {format_duration(elapsed)}",
+        f"Checks run this session: {CHECKS_RUN}",
         f"Check interval: {CHECK_INTERVAL_SECONDS}s",
-        parse_mode=ParseMode.HTML,
-    )
+        "",
+        f"📶 Proxy data this session: <b>{used / 1048576:.1f} MB</b>",
+        f"At this rate: ~{per_day / 1073741824:.2f} GB/day",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def edit_result_message(query, text: str, reply_markup=None):
@@ -720,7 +728,10 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
     client = await get_warm_client(context)
 
     for username in usernames:
-        result = await check_instagram_status(username, client)
+        # Pass what we already know so an unchanged account can be confirmed
+        # from headers alone instead of pulling the whole page every minute.
+        known = storage.get_state(username)["confirmed_status"]
+        result = await check_instagram_status(username, client, known_status=known)
         CHECKS_RUN += 1
         await apply_check_result(context, username, result)
 
