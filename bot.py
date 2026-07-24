@@ -418,7 +418,7 @@ async def post_init(application: Application):
 async def post_shutdown(application: Application):
     client = application.bot_data.get("http_client")
     if client is not None:
-        await client.aclose()
+        await client.close()
 
 
 def main():
