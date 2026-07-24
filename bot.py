@@ -32,6 +32,10 @@ ALLOWED_CHAT_IDS = {
     int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if x
 }
 MAX_WATCH_PER_MESSAGE = 10
+# Re-fetching Instagram's homepage for fresh cookies on every single check is
+# wasteful, especially through a metered proxy - reuse one warm client and
+# only refresh its cookies this often instead of every check cycle.
+COOKIE_REFRESH_SECONDS = 1800
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ig-watch-bot")
@@ -110,6 +114,16 @@ def watch_keyboard(username: str, paused: bool) -> InlineKeyboardMarkup:
     )
 
 
+async def get_warm_client(context: ContextTypes.DEFAULT_TYPE):
+    bot_data = context.application.bot_data
+    client = bot_data["http_client"]
+    warmed_at = bot_data.get("cookies_warmed_at")
+    if warmed_at is None or time.monotonic() - warmed_at > COOKIE_REFRESH_SECONDS:
+        await warm_up_client(client)
+        bot_data["cookies_warmed_at"] = time.monotonic()
+    return client
+
+
 def restricted(handler):
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -143,24 +157,23 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usernames = [clean_username(u) for u in context.args[:MAX_WATCH_PER_MESSAGE]]
     chat_id = update.effective_chat.id
 
-    async with make_client() as client:
-        await warm_up_client(client)
-        for username in usernames:
-            result = await check_instagram_status(username, client)
-            if result.status is None:
-                await update.message.reply_text(
-                    f"⚠️ Couldn't verify {fmt(username)} right now ({result.error}).",
-                    parse_mode=ParseMode.HTML,
-                )
-                continue
-            storage.add_watch(chat_id, username)
-            storage.set_confirmed(username, result.status, vars(result))
-            state = storage.get_state(username)
+    client = await get_warm_client(context)
+    for username in usernames:
+        result = await check_instagram_status(username, client)
+        if result.status is None:
             await update.message.reply_text(
-                f"✅ Now tracking {fmt(username)}\n{STATUS_LABELS[result.status]}{profile_summary(state)}",
+                f"⚠️ Couldn't verify {fmt(username)} right now ({result.error}).",
                 parse_mode=ParseMode.HTML,
-                reply_markup=watch_keyboard(username, paused=False),
             )
+            continue
+        storage.add_watch(chat_id, username)
+        storage.set_confirmed(username, result.status, vars(result))
+        state = storage.get_state(username)
+        await update.message.reply_text(
+            f"✅ Now tracking {fmt(username)}\n{STATUS_LABELS[result.status]}{profile_summary(state)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=watch_keyboard(username, paused=False),
+        )
 
 
 @restricted
@@ -170,9 +183,8 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     username = clean_username(context.args[0])
 
-    async with make_client() as client:
-        await warm_up_client(client)
-        result = await check_instagram_status(username, client)
+    client = await get_warm_client(context)
+    result = await check_instagram_status(username, client)
 
     if result.status is None:
         await update.message.reply_text(
@@ -286,9 +298,8 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"Unmuted @{username}")
     elif action == "check":
         await query.answer("Checking...")
-        async with make_client() as client:
-            await warm_up_client(client)
-            result = await check_instagram_status(username, client)
+        client = await get_warm_client(context)
+        result = await check_instagram_status(username, client)
         if result.status is not None:
             storage.set_confirmed(username, result.status, vars(result))
     else:
@@ -356,50 +367,58 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     consecutive_blocks = 0
+    client = await get_warm_client(context)
 
-    async with make_client() as client:
-        await warm_up_client(client)
-        for username in usernames:
-            result = await check_instagram_status(username, client)
-            CHECKS_RUN += 1
+    for username in usernames:
+        result = await check_instagram_status(username, client)
+        CHECKS_RUN += 1
 
-            if result.error == "rate_limited":
-                consecutive_blocks += 1
-                # Back off harder the more blocks we see in a row, instead of
-                # keeping up the same pace and getting blocked even longer.
-                backoff = min(60, 5 * (2 ** consecutive_blocks))
-                logger.warning(
-                    "%s: rate limited (%d in a row), backing off %ds", username, consecutive_blocks, backoff
-                )
-                await asyncio.sleep(backoff)
-                if consecutive_blocks >= 3:
-                    logger.warning("too many consecutive blocks, skipping rest of this cycle")
-                    break
-            else:
-                consecutive_blocks = 0
-                await asyncio.sleep(random.uniform(1, 3))  # spread requests out, avoid bursty IP blocks
+        if result.error == "rate_limited":
+            consecutive_blocks += 1
+            # Back off harder the more blocks we see in a row, instead of
+            # keeping up the same pace and getting blocked even longer.
+            backoff = min(60, 5 * (2 ** consecutive_blocks))
+            logger.warning(
+                "%s: rate limited (%d in a row), backing off %ds", username, consecutive_blocks, backoff
+            )
+            await asyncio.sleep(backoff)
+            if consecutive_blocks >= 3:
+                logger.warning("too many consecutive blocks, skipping rest of this cycle")
+                break
+        else:
+            consecutive_blocks = 0
+            await asyncio.sleep(random.uniform(1, 3))  # spread requests out, avoid bursty IP blocks
 
-            if result.status is None:
-                logger.info("%s: temporary check issue (%s) — keeping last confirmed status", username, result.error)
-                continue
+        if result.status is None:
+            logger.info("%s: temporary check issue (%s) — keeping last confirmed status", username, result.error)
+            continue
 
-            state = storage.get_state(username)
-            confirmed = state["confirmed_status"]
+        state = storage.get_state(username)
+        confirmed = state["confirmed_status"]
 
-            if result.status == confirmed:
-                storage.clear_pending(username)
-                continue
+        if result.status == confirmed:
+            storage.clear_pending(username)
+            continue
 
-            _, pending_count = storage.bump_pending(username, result.status)
-            if pending_count < CONFIRM_CHECKS:
-                continue
+        _, pending_count = storage.bump_pending(username, result.status)
+        if pending_count < CONFIRM_CHECKS:
+            continue
 
-            storage.set_confirmed(username, result.status, vars(result))
-            await notify_watchers(context, username, confirmed, result.status)
+        storage.set_confirmed(username, result.status, vars(result))
+        await notify_watchers(context, username, confirmed, result.status)
 
 
-async def register_commands(application: Application):
+async def post_init(application: Application):
+    application.bot_data["http_client"] = make_client()
+    await warm_up_client(application.bot_data["http_client"])
+    application.bot_data["cookies_warmed_at"] = time.monotonic()
     await application.bot.set_my_commands(BOT_COMMANDS)
+
+
+async def post_shutdown(application: Application):
+    client = application.bot_data.get("http_client")
+    if client is not None:
+        await client.aclose()
 
 
 def main():
@@ -407,7 +426,13 @@ def main():
     # Python 3.14 removed asyncio.get_event_loop()'s implicit loop creation, which
     # python-telegram-bot's run_polling() still relies on. Set one explicitly.
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(BOT_TOKEN).post_init(register_commands).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
