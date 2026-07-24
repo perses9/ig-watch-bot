@@ -278,6 +278,54 @@ async def _check_via_api(username: str, client: AsyncSession) -> CheckResult:
     return CheckResult(status=None, error=f"http_{resp.status_code}")
 
 
+TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+async def diagnose(username: str, client: AsyncSession) -> list:
+    """Report what Instagram actually sends back, for each persona we try.
+
+    Classification here depends on recognising Instagram's markup, and their
+    responses vary by IP, region, and over time. When a check comes back
+    inconclusive this shows the real response instead of leaving us guessing
+    at which marker to add next.
+    """
+    reports = []
+
+    for label, headers in (("browser", _doc_headers()), ("crawler", _crawler_headers())):
+        report = {"persona": label}
+        try:
+            resp = await client.get(
+                f"{BASE_URL}/{username}/?hl=en", headers=headers, timeout=15, allow_redirects=False
+            )
+        except RequestException as exc:
+            report["error"] = type(exc).__name__
+            reports.append(report)
+            continue
+
+        page = resp.text or ""
+        title = TITLE_RE.search(page)
+        visible = TAG_RE.sub(" ", page[:4000])
+        visible = " ".join(visible.split())
+
+        report.update(
+            {
+                "status": resp.status_code,
+                "location": resp.headers.get("location"),
+                "bytes": len(page),
+                "title": title.group(1).strip()[:80] if title else None,
+                "og_title": bool(OG_TITLE_RE.search(page)),
+                "og_description": bool(OG_DESC_RE.search(page)),
+                "not_found_marker": next((m for m in NOT_FOUND_MARKERS if m in page), None),
+                "login_marker": next((m for m in LOGIN_WALL_MARKERS if m in page), None),
+                "text": visible[:400],
+            }
+        )
+        reports.append(report)
+
+    return reports
+
+
 async def check_instagram_status(username: str, client: AsyncSession) -> CheckResult:
     result = await _check_via_html(username, client)
     if result.status is not None:

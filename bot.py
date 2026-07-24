@@ -13,7 +13,7 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import storage
-from ig_checker import check_instagram_status, make_client, warm_up_client
+from ig_checker import check_instagram_status, diagnose, make_client, warm_up_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ig-watch-bot")
@@ -439,6 +439,49 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+@owner_only
+async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows what Instagram actually returns, so a failing check can be
+    diagnosed from real responses rather than guessed at."""
+    if not context.args:
+        await update.message.reply_text("Usage: /diag <username>")
+        return
+
+    username = clean_username(context.args[0])
+    await update.message.reply_text(f"🔬 Probing {fmt(username)}…", parse_mode=ParseMode.HTML)
+
+    client = await get_warm_client(context)
+    reports = await diagnose(username, client)
+    result = await check_instagram_status(username, client)
+
+    lines = [f"🔬 <b>Diagnostics for {fmt(username)}</b>"]
+    for report in reports:
+        lines.append(f"\n<b>{report['persona']}</b>")
+        if report.get("error"):
+            lines.append(f"  request failed: <code>{report['error']}</code>")
+            continue
+        lines.append(f"  HTTP <b>{report['status']}</b> · {report['bytes']:,} bytes")
+        if report.get("location"):
+            lines.append(f"  → <code>{html.escape(str(report['location'])[:80])}</code>")
+        if report.get("title"):
+            lines.append(f"  title: <code>{html.escape(report['title'])}</code>")
+        lines.append(
+            f"  og:title {'✅' if report['og_title'] else '❌'} · "
+            f"og:desc {'✅' if report['og_description'] else '❌'}"
+        )
+        if report.get("not_found_marker"):
+            lines.append(f"  not-found marker: <code>{html.escape(report['not_found_marker'])}</code>")
+        if report.get("login_marker"):
+            lines.append(f"  login marker: <code>{html.escape(report['login_marker'])}</code>")
+        if report.get("text"):
+            lines.append(f"  text: <code>{html.escape(report['text'][:250])}</code>")
+
+    verdict = result.status or f"inconclusive ({result.error})"
+    lines.append(f"\n<b>Verdict:</b> {html.escape(verdict)}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 @restricted
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -722,6 +765,7 @@ def main():
     app.add_handler(CommandHandler("adduser", adduser_cmd))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CallbackQueryHandler(button_cmd))
     app.add_error_handler(on_error)
 

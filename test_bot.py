@@ -605,6 +605,7 @@ def test_application_assembles():
         ("resume", bot.resume_cmd), ("list", bot.list_cmd), ("uptime", bot.uptime_cmd),
         ("myid", bot.myid_cmd), ("adduser", bot.adduser_cmd),
         ("removeuser", bot.removeuser_cmd), ("users", bot.users_cmd),
+        ("diag", bot.diag_cmd),
     ):
         check(f"/{name} is callable", callable(handler))
 
