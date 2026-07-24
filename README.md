@@ -32,10 +32,17 @@ from not-found back to live, everyone tracking it gets pinged immediately.
 
 ## Commands
 
-- `/watch <username>` — start tracking an account
-- `/list` — show tracked accounts and their current status
+- `/watch <username> [username2 ...]` — start tracking one or more accounts (checked immediately)
+- `/check <username>` — check status right now, without waiting for the next cycle or adding it to your list
+- `/list` — show tracked accounts, status, follower count, and mute state
 - `/remove <username>` — stop tracking an account
+- `/pause <username>` / `/resume <username>` — mute or unmute notifications for an account without removing it
+- `/uptime` — bot uptime and how many checks it's run this session
 - `/help` — show usage
+
+## Access control
+
+Anyone who finds your bot's username on Telegram can message it and use every command above, by default. Since the source (and therefore the bot's behavior) is public, set `ALLOWED_CHAT_IDS` in `.env` to your own Telegram chat ID to restrict it to just you. To find your chat ID: message [@userinfobot](https://t.me/userinfobot), it replies with your ID. Comma-separate multiple IDs if more than one person should have access.
 
 ## Setup
 

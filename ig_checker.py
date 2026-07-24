@@ -19,6 +19,10 @@ class CheckResult:
     # status is "live" or "not_found"; None means the check itself failed (rate limit, timeout, etc.)
     status: Optional[str]
     error: Optional[str] = None
+    full_name: Optional[str] = None
+    follower_count: Optional[int] = None
+    is_private: Optional[bool] = None
+    profile_pic_url: Optional[str] = None
 
 
 async def check_instagram_status(username: str, client: httpx.AsyncClient) -> CheckResult:
@@ -33,7 +37,15 @@ async def check_instagram_status(username: str, client: httpx.AsyncClient) -> Ch
             user = resp.json().get("data", {}).get("user")
         except ValueError:
             return CheckResult(status=None, error="bad_json")
-        return CheckResult(status="live" if user else "not_found")
+        if not user:
+            return CheckResult(status="not_found")
+        return CheckResult(
+            status="live",
+            full_name=user.get("full_name") or None,
+            follower_count=(user.get("edge_followed_by") or {}).get("count"),
+            is_private=user.get("is_private"),
+            profile_pic_url=user.get("profile_pic_url_hd") or user.get("profile_pic_url"),
+        )
 
     if resp.status_code == 404:
         return CheckResult(status="not_found")
