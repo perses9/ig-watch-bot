@@ -222,13 +222,22 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = await get_warm_client(context)
     for username in usernames:
         result = await check_instagram_status(username, client)
+
+        # Track it either way. Instagram's logged-out responses are flaky, and
+        # refusing to add an account just because one check was inconclusive
+        # means the background loop never gets a chance to sort it out.
+        storage.add_watch(chat_id, username)
+
         if result.status is None:
             await update.message.reply_text(
-                f"⚠️ Couldn't verify {fmt(username)} right now ({result.error}).",
+                f"✅ Now tracking {fmt(username)}\n"
+                f"⚪️ <b>Unknown</b> — couldn't verify right now ({result.error}), "
+                f"retrying every {CHECK_INTERVAL_SECONDS}s.",
                 parse_mode=ParseMode.HTML,
+                reply_markup=watch_keyboard(username, paused=False),
             )
             continue
-        storage.add_watch(chat_id, username)
+
         storage.set_confirmed(username, result.status, vars(result))
         state = storage.get_state(username)
         await update.message.reply_text(
@@ -559,6 +568,14 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
 
         if result.status == confirmed:
             storage.clear_pending(username)
+            continue
+
+        # First time this account ever resolved (added while unverifiable):
+        # record the baseline silently. Announcing it would just be noise -
+        # nothing actually changed, we simply learned where it stands.
+        if confirmed in (None, "unknown"):
+            storage.set_confirmed(username, result.status, vars(result))
+            logger.info("%s: baseline status recorded as %s", username, result.status)
             continue
 
         _, pending_count = storage.bump_pending(username, result.status)

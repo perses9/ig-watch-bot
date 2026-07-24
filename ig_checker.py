@@ -31,6 +31,16 @@ NOT_FOUND_MARKERS = (
     "Page Not Found",
 )
 
+# Markers of the logged-out login page. Only consulted after we've already
+# ruled out a not-found page and failed to find profile metadata, so a real
+# profile page's "Log in" header link can't be mistaken for the login wall.
+LOGIN_WALL_MARKERS = (
+    'name="username"',
+    "Log in to Instagram",
+    "loginForm",
+    "LoginAndSignupPage",
+)
+
 OG_TITLE_RE = re.compile(r'<meta[^>]+property="og:title"[^>]+content="([^"]*)"', re.I)
 OG_DESC_RE = re.compile(r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"', re.I)
 OG_IMAGE_RE = re.compile(r'<meta[^>]+property="og:image"[^>]+content="([^"]*)"', re.I)
@@ -53,6 +63,19 @@ def _doc_headers() -> dict:
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1",
+    }
+
+
+def _crawler_headers() -> dict:
+    # Instagram serves og: preview metadata to link-preview crawlers without
+    # a login wall - that's how a shared profile link renders a preview card
+    # in WhatsApp, Messenger, or Slack. When the logged-out browser view
+    # bounces to a login page, this view often still answers with the tags
+    # we need.
+    return {
+        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
 
@@ -142,15 +165,13 @@ def _parse_profile_html(html: str) -> dict:
     return profile
 
 
-async def _check_via_html(username: str, client: AsyncSession) -> CheckResult:
-    """Primary check: the public profile page. Instagram still serves this to
-    logged-out visitors (with og: meta tags for crawlers), and returns a clean
-    404 for accounts that are suspended, deactivated, or never existed — which
-    is exactly the live/down signal we need. The JSON API this used to call
-    now demands a logged-in session and answers 401."""
-    url = f"{BASE_URL}/{username}/"
+async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict) -> CheckResult:
+    """One attempt at the public profile page. hl=en pins the response language:
+    the proxy hands out IPs from random countries, and a localised page would
+    break both the follower parsing and the not-found markers."""
+    url = f"{BASE_URL}/{username}/?hl=en"
     try:
-        resp = await client.get(url, headers=_doc_headers(), timeout=15, allow_redirects=False)
+        resp = await client.get(url, headers=headers, timeout=15, allow_redirects=False)
     except RequestException as exc:
         return CheckResult(status=None, error=type(exc).__name__)
 
@@ -179,11 +200,41 @@ async def _check_via_html(username: str, client: AsyncSession) -> CheckResult:
     if profile.get("full_name") or profile.get("follower_count") is not None:
         return CheckResult(status="live", **profile)
 
-    # 200 with neither a not-found marker nor any profile metadata usually
-    # means we got the logged-out interstitial rather than the profile.
-    # Report it as a check issue so the last confirmed status is kept,
-    # rather than guessing and firing a false alert.
+    # Ordering matters: only once a not-found page and real profile metadata
+    # are both ruled out can login markers be trusted, since a live profile
+    # page also contains "Log in" chrome.
+    if any(marker in html for marker in LOGIN_WALL_MARKERS):
+        return CheckResult(status=None, error="login_wall")
+
     return CheckResult(status=None, error="no_profile_data")
+
+
+async def _check_via_html(username: str, client: AsyncSession) -> CheckResult:
+    """Primary check: the public profile page. Instagram returns a clean 404
+    for accounts that are suspended, deactivated, or never existed, and serves
+    og: metadata for live ones — exactly the signal this bot needs, with no
+    login required. (The JSON API it used to call now answers 401.)
+
+    Logged-out treatment varies by edge server, and the proxy rotates to a
+    different residential IP per request, so one attempt landing on a login
+    wall says nothing about the next. Try as a browser, then as a link-preview
+    crawler, which Instagram serves og: tags to even when it walls off the
+    browser view."""
+    attempts = (_doc_headers(), _crawler_headers())
+    first_result = None
+
+    for headers in attempts:
+        result = await _fetch_profile_page(username, client, headers)
+        if result.status is not None:
+            return result
+        if first_result is None:
+            first_result = result
+        # A rate limit applies to the IP, not the persona - a second request
+        # right now would only dig the hole deeper.
+        if result.error == "rate_limited":
+            break
+
+    return first_result
 
 
 async def _check_via_api(username: str, client: AsyncSession) -> CheckResult:
