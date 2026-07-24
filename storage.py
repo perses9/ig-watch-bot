@@ -186,10 +186,14 @@ def set_confirmed(username, status, profile=None):
                  pending_status=NULL,
                  pending_count=0,
                  updated_at=excluded.updated_at,
-                 full_name=excluded.full_name,
-                 follower_count=excluded.follower_count,
-                 is_private=excluded.is_private,
-                 profile_pic_url=excluded.profile_pic_url,
+                 -- COALESCE, not a plain overwrite: a not_found result carries
+                 -- no profile fields, and blindly copying those NULLs would
+                 -- erase the name and picture of exactly the accounts we most
+                 -- want to identify in a "went down" alert.
+                 full_name=COALESCE(excluded.full_name, full_name),
+                 follower_count=COALESCE(excluded.follower_count, follower_count),
+                 is_private=COALESCE(excluded.is_private, is_private),
+                 profile_pic_url=COALESCE(excluded.profile_pic_url, profile_pic_url),
                  down_since=excluded.down_since""",
             (
                 username, status, now_str,

@@ -9,6 +9,7 @@ from functools import wraps
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import storage
@@ -32,9 +33,13 @@ BOT_COMMANDS = [
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "15"))
 CONFIRM_CHECKS = int(os.environ.get("CONFIRM_CHECKS", "2"))
-ALLOWED_CHAT_IDS = {
+# Order is preserved: the fallback owner is whoever is listed first, which
+# would be wrong if this were a set - group chat IDs are large negative
+# numbers, so picking the smallest would hand ownership to a group.
+ALLOWED_CHAT_ID_LIST = [
     int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if x
-}
+]
+ALLOWED_CHAT_IDS = set(ALLOWED_CHAT_ID_LIST)
 
 
 def _resolve_owner():
@@ -47,7 +52,7 @@ def _resolve_owner():
             return int(raw)
         except ValueError:
             logger.warning("OWNER_CHAT_ID=%r is not a number, ignoring it", raw)
-    return min(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else None
+    return ALLOWED_CHAT_ID_LIST[0] if ALLOWED_CHAT_ID_LIST else None
 
 
 OWNER_CHAT_ID = _resolve_owner()
@@ -161,6 +166,16 @@ def is_owner(chat_id: int) -> bool:
     return OWNER_CHAT_ID is not None and chat_id == OWNER_CHAT_ID
 
 
+def env_guest_ids() -> set:
+    """People granted access by the ALLOWED_CHAT_IDS setting rather than by
+    invite. They can't be revoked from chat, but they do occupy a slot."""
+    return ALLOWED_CHAT_IDS - {OWNER_CHAT_ID}
+
+
+def used_guest_slots() -> int:
+    return storage.count_allowed_users() + len(env_guest_ids())
+
+
 def is_authorized(chat_id: int) -> bool:
     # With no owner and no allowlist configured the bot is open to anyone -
     # same as before access control existed. Setting either one locks it down.
@@ -238,7 +253,11 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             continue
 
-        storage.set_confirmed(username, result.status, vars(result))
+        # Goes through the same transition logic as the background loop rather
+        # than writing the status directly: someone adding an account that
+        # others already track must not clobber a pending change or skip the
+        # alert that change was about to produce.
+        await apply_check_result(context, username, result)
         state = storage.get_state(username)
         await update.message.reply_text(
             f"✅ Now tracking {fmt(username)}\n{STATUS_LABELS[result.status]}{profile_summary(state)}",
@@ -347,7 +366,7 @@ async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("That person already has access.")
         return
 
-    if storage.count_allowed_users() >= MAX_GUEST_USERS:
+    if used_guest_slots() >= MAX_GUEST_USERS:
         await update.message.reply_text(
             f"⚠️ You've reached the limit of {MAX_GUEST_USERS} people.\n"
             "Use /users to see who has access, and /removeuser &lt;chat_id&gt; to free up a slot.",
@@ -357,7 +376,7 @@ async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     label = " ".join(context.args[1:]).strip() or None
     storage.add_allowed_user(new_id, label)
-    used = storage.count_allowed_users()
+    used = used_guest_slots()
     who = f" ({html.escape(label)})" if label else ""
     await update.message.reply_text(
         f"✅ Access granted to <code>{new_id}</code>{who}\n"
@@ -379,10 +398,20 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if storage.remove_allowed_user(target):
-        used = storage.count_allowed_users()
+        used = used_guest_slots()
         await update.message.reply_text(
             f"🚫 Access revoked for <code>{target}</code>, and their tracked accounts were removed.\n"
             f"{used} of {MAX_GUEST_USERS} slots used.",
+            parse_mode=ParseMode.HTML,
+        )
+    elif target in ALLOWED_CHAT_IDS:
+        # Granted by the ALLOWED_CHAT_IDS setting, so there's no database row
+        # to delete - saying "didn't have access" would be a lie, since they
+        # still do.
+        await update.message.reply_text(
+            f"⚠️ <code>{target}</code> was granted access by the <code>ALLOWED_CHAT_IDS</code> "
+            "setting, so I can't revoke it from here. Remove them from that variable in your "
+            "hosting dashboard instead.",
             parse_mode=ParseMode.HTML,
         )
     else:
@@ -392,7 +421,7 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = storage.list_allowed_users()
-    lines = [f"👥 <b>Access ({len(users)} of {MAX_GUEST_USERS} slots used)</b>", ""]
+    lines = [f"👥 <b>Access ({used_guest_slots()} of {MAX_GUEST_USERS} slots used)</b>", ""]
     lines.append(f"👑 <code>{OWNER_CHAT_ID}</code> — you (owner)")
 
     for user in users:
@@ -400,9 +429,9 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tracked = len(storage.list_watches(user["chat_id"]))
         lines.append(f"• <code>{user['chat_id']}</code>{label} — tracking {tracked}")
 
-    if ALLOWED_CHAT_IDS - {OWNER_CHAT_ID}:
-        extra = ", ".join(str(i) for i in sorted(ALLOWED_CHAT_IDS - {OWNER_CHAT_ID}))
-        lines.append(f"\n<i>Also allowed via the ALLOWED_CHAT_IDS setting: {extra}</i>")
+    for chat_id in sorted(env_guest_ids()):
+        tracked = len(storage.list_watches(chat_id))
+        lines.append(f"• <code>{chat_id}</code> — via ALLOWED_CHAT_IDS — tracking {tracked}")
 
     if not users:
         lines.append("\n<i>No one else has access yet. Use /adduser &lt;chat_id&gt; to invite someone.</i>")
@@ -444,6 +473,32 @@ async def uptime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def edit_result_message(query, text: str, reply_markup=None):
+    """Update the message a button lives on.
+
+    The back-online alert is sent as a photo, and Telegram refuses
+    editMessageText on a media message — so the buttons on the single most
+    important message the bot sends did nothing at all. Edit the caption in
+    that case. Re-tapping a button that produces identical text is also a
+    Telegram error, and a harmless one."""
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        return
+    except BadRequest as exc:
+        detail = str(exc).lower()
+        if "message is not modified" in detail:
+            return
+        if "no text in the message" not in detail:
+            logger.warning("couldn't edit message: %s", exc)
+            return
+
+    try:
+        await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            logger.warning("couldn't edit caption: %s", exc)
+
+
 async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = update.effective_chat.id
@@ -457,7 +512,7 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "remove":
         storage.remove_watch(chat_id, username)
         await query.answer(f"Removed @{username}")
-        await query.edit_message_text(f"🗑 Stopped tracking {fmt(username)}.", parse_mode=ParseMode.HTML)
+        await edit_result_message(query, f"🗑 Stopped tracking {fmt(username)}.")
         return
 
     if action == "pause":
@@ -470,8 +525,12 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Checking...")
         client = await get_warm_client(context)
         result = await check_instagram_status(username, client)
-        if result.status is not None:
-            storage.set_confirmed(username, result.status, vars(result))
+        # Same transition logic as everywhere else. Writing the status
+        # directly here used to consume the pending change, so a manual check
+        # that happened to catch the recovery meant nobody was ever told.
+        await apply_check_result(context, username, result)
+        if result.status is None:
+            await query.answer(f"Couldn't verify right now ({result.error})", show_alert=True)
     else:
         await query.answer()
         return
@@ -481,23 +540,32 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     watches = storage.list_watches(chat_id)
     paused = next((w["paused"] for w in watches if w["username"] == username), False)
     mute_tag = " · 🔇 muted" if paused else ""
-    await query.edit_message_text(
+    await edit_result_message(
+        query,
         f"{fmt(username)}\n{STATUS_LABELS.get(status, status)}{profile_summary(state)}{mute_tag}",
-        parse_mode=ParseMode.HTML,
         reply_markup=watch_keyboard(username, paused=paused),
     )
 
 
-async def notify_watchers(context: ContextTypes.DEFAULT_TYPE, username: str, old_status: str, new_status: str):
+async def notify_watchers(
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+    old_status: str,
+    new_status: str,
+    down_since: str = None,
+):
+    """down_since has to be passed in by the caller, read *before* the status
+    was updated: recording a live status clears the column, so by the time we
+    get here there is nothing left to measure the downtime against."""
     state = storage.get_state(username)
     summary = profile_summary(state)
 
     if new_status == "live" and old_status == "not_found":
         downtime = ""
-        if state.get("down_since"):
+        if down_since:
             try:
-                down_since = datetime.fromisoformat(state["down_since"])
-                downtime_seconds = (datetime.utcnow() - down_since).total_seconds()
+                went_down = datetime.fromisoformat(down_since)
+                downtime_seconds = (datetime.utcnow() - went_down).total_seconds()
                 downtime = f" after {format_duration(downtime_seconds)}"
             except ValueError:
                 pass
@@ -511,23 +579,71 @@ async def notify_watchers(context: ContextTypes.DEFAULT_TYPE, username: str, old
         text = f"ℹ️ {fmt(username)} status changed to {STATUS_LABELS.get(new_status, new_status)}{summary}"
 
     keyboard = watch_keyboard(username, paused=False)
+    photo = state.get("profile_pic_url") if new_status == "live" else None
 
     for chat_id in storage.chats_watching(username, only_unpaused=True):
-        try:
-            if new_status == "live" and state.get("profile_pic_url"):
+        if photo:
+            try:
                 await context.bot.send_photo(
                     chat_id=chat_id,
-                    photo=state["profile_pic_url"],
+                    photo=photo,
                     caption=text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=keyboard,
                 )
-            else:
-                await context.bot.send_message(
-                    chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard
-                )
+                continue
+            except Exception:
+                # Instagram's CDN URLs are signed and expire, so Telegram
+                # often can't fetch them. The alert matters far more than the
+                # picture — fall through and send it as plain text.
+                logger.warning("couldn't attach photo for %s, sending text instead", username)
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+            )
         except Exception:
             logger.exception("failed to notify chat %s about %s", chat_id, username)
+
+
+async def apply_check_result(context: ContextTypes.DEFAULT_TYPE, username: str, result) -> bool:
+    """Record a check result and announce it if it's a genuine status change.
+
+    Every path that checks an account goes through here — the background loop
+    and the "Check now" button alike. When the button wrote straight to
+    storage instead, a manual check landing on the recovery would overwrite
+    the stored status without telling anyone, and the background loop would
+    then see no change left to report, silently eating the alert.
+
+    Returns True if watchers were notified."""
+    if result.status is None:
+        logger.info("%s: check inconclusive (%s) — keeping last confirmed status", username, result.error)
+        return False
+
+    state = storage.get_state(username)
+    confirmed = state["confirmed_status"]
+
+    if result.status == confirmed:
+        storage.clear_pending(username)
+        return False
+
+    # First time this account ever resolved (it was added while unverifiable):
+    # record the baseline silently. Nothing changed, we simply learned where
+    # it stands, and announcing that would just be noise.
+    if confirmed in (None, "unknown"):
+        storage.set_confirmed(username, result.status, vars(result))
+        logger.info("%s: baseline status recorded as %s", username, result.status)
+        return False
+
+    _, pending_count = storage.bump_pending(username, result.status)
+    if pending_count < CONFIRM_CHECKS:
+        return False
+
+    # Read before writing — set_confirmed clears down_since on recovery.
+    down_since = state.get("down_since")
+    storage.set_confirmed(username, result.status, vars(result))
+    await notify_watchers(context, username, confirmed, result.status, down_since=down_since)
+    return True
 
 
 async def check_job(context: ContextTypes.DEFAULT_TYPE):
@@ -542,48 +658,29 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
     for username in usernames:
         result = await check_instagram_status(username, client)
         CHECKS_RUN += 1
+        await apply_check_result(context, username, result)
 
         if result.error == "rate_limited":
             consecutive_blocks += 1
-            # Back off harder the more blocks we see in a row, instead of
-            # keeping up the same pace and getting blocked even longer.
-            backoff = min(60, 5 * (2 ** consecutive_blocks))
-            logger.warning(
-                "%s: rate limited (%d in a row), backing off %ds", username, consecutive_blocks, backoff
-            )
-            await asyncio.sleep(backoff)
-            if consecutive_blocks >= 3:
-                logger.warning("too many consecutive blocks, skipping rest of this cycle")
+            # Give up on the cycle rather than sleeping it off in place. A long
+            # sleep here stalls every other account behind it, and the next
+            # cycle is only CHECK_INTERVAL_SECONDS away anyway.
+            if consecutive_blocks >= 2:
+                logger.warning("rate limited repeatedly, ending this cycle early")
                 break
+            await asyncio.sleep(5)
         else:
             consecutive_blocks = 0
-            await asyncio.sleep(random.uniform(1, 3))  # spread requests out, avoid bursty IP blocks
+            # Small gap between accounts so a cycle doesn't arrive as one
+            # burst. Kept short: overrunning the interval makes the scheduler
+            # skip cycles, which quietly stretches the detection time.
+            await asyncio.sleep(random.uniform(0.4, 1.2))
 
-        if result.status is None:
-            logger.info("%s: temporary check issue (%s) — keeping last confirmed status", username, result.error)
-            continue
 
-        state = storage.get_state(username)
-        confirmed = state["confirmed_status"]
-
-        if result.status == confirmed:
-            storage.clear_pending(username)
-            continue
-
-        # First time this account ever resolved (added while unverifiable):
-        # record the baseline silently. Announcing it would just be noise -
-        # nothing actually changed, we simply learned where it stands.
-        if confirmed in (None, "unknown"):
-            storage.set_confirmed(username, result.status, vars(result))
-            logger.info("%s: baseline status recorded as %s", username, result.status)
-            continue
-
-        _, pending_count = storage.bump_pending(username, result.status)
-        if pending_count < CONFIRM_CHECKS:
-            continue
-
-        storage.set_confirmed(username, result.status, vars(result))
-        await notify_watchers(context, username, confirmed, result.status)
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Without this, an exception in a handler is swallowed and the user just
+    sees the bot do nothing."""
+    logger.exception("unhandled error while processing %s", update, exc_info=context.error)
 
 
 async def post_init(application: Application):
@@ -626,6 +723,7 @@ def main():
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CallbackQueryHandler(button_cmd))
+    app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(check_job, interval=CHECK_INTERVAL_SECONDS, first=10)
 

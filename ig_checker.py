@@ -1,3 +1,4 @@
+import html
 import os
 import re
 from dataclasses import dataclass
@@ -142,25 +143,29 @@ def _parse_follower_count(description: str) -> Optional[int]:
     return int(value * multiplier)
 
 
-def _parse_profile_html(html: str) -> dict:
+def _parse_profile_html(page: str) -> dict:
     """Pull what we can out of the og: meta tags Instagram serves to logged-out
     visitors. Everything here is best-effort — absence of a field never means
     the account is down, only that the page didn't advertise it."""
     profile = {}
 
-    title_match = OG_TITLE_RE.search(html)
+    # Attribute values arrive HTML-escaped. Un-escaping matters most for the
+    # image: Instagram's CDN URLs are signed and full of &amp;-separated
+    # parameters, so leaving them escaped yields a URL that simply doesn't
+    # work — which is how the profile photo silently broke the alert.
+    title_match = OG_TITLE_RE.search(page)
     if title_match:
-        name_match = FULL_NAME_RE.match(title_match.group(1))
+        name_match = FULL_NAME_RE.match(html.unescape(title_match.group(1)))
         if name_match and name_match.group(1).strip():
             profile["full_name"] = name_match.group(1).strip()
 
-    desc_match = OG_DESC_RE.search(html)
+    desc_match = OG_DESC_RE.search(page)
     if desc_match:
-        profile["follower_count"] = _parse_follower_count(desc_match.group(1))
+        profile["follower_count"] = _parse_follower_count(html.unescape(desc_match.group(1)))
 
-    image_match = OG_IMAGE_RE.search(html)
+    image_match = OG_IMAGE_RE.search(page)
     if image_match:
-        profile["profile_pic_url"] = image_match.group(1)
+        profile["profile_pic_url"] = html.unescape(image_match.group(1))
 
     return profile
 
@@ -191,19 +196,19 @@ async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict
     if resp.status_code != 200:
         return CheckResult(status=None, error=f"http_{resp.status_code}")
 
-    html = resp.text or ""
+    page = resp.text or ""
 
-    if any(marker in html for marker in NOT_FOUND_MARKERS):
+    if any(marker in page for marker in NOT_FOUND_MARKERS):
         return CheckResult(status="not_found")
 
-    profile = _parse_profile_html(html)
+    profile = _parse_profile_html(page)
     if profile.get("full_name") or profile.get("follower_count") is not None:
         return CheckResult(status="live", **profile)
 
     # Ordering matters: only once a not-found page and real profile metadata
     # are both ruled out can login markers be trusted, since a live profile
     # page also contains "Log in" chrome.
-    if any(marker in html for marker in LOGIN_WALL_MARKERS):
+    if any(marker in page for marker in LOGIN_WALL_MARKERS):
         return CheckResult(status=None, error="login_wall")
 
     return CheckResult(status=None, error="no_profile_data")
@@ -227,12 +232,14 @@ async def _check_via_html(username: str, client: AsyncSession) -> CheckResult:
         result = await _fetch_profile_page(username, client, headers)
         if result.status is not None:
             return result
+        # A rate limit applies to the IP, not the persona, so stop trying - and
+        # report it rather than the earlier error. The caller keys its backoff
+        # off this value, and burying it behind a first-attempt "login_wall"
+        # means the bot keeps hammering an IP that just told it to stop.
+        if result.error == "rate_limited":
+            return result
         if first_result is None:
             first_result = result
-        # A rate limit applies to the IP, not the persona - a second request
-        # right now would only dig the hole deeper.
-        if result.error == "rate_limited":
-            break
 
     return first_result
 
@@ -276,10 +283,17 @@ async def check_instagram_status(username: str, client: AsyncSession) -> CheckRe
     if result.status is not None:
         return result
 
+    # Already throttled: another request would only extend the block, and the
+    # caller needs to see the rate limit to back off.
+    if result.error == "rate_limited":
+        return result
+
     # HTML was inconclusive — try the API before giving up. It's often blocked
     # now, but when it does answer it's the more detailed of the two.
     api_result = await _check_via_api(username, client)
     if api_result.status is not None:
+        return api_result
+    if api_result.error == "rate_limited":
         return api_result
 
     # Both inconclusive: report the HTML failure, since that's the primary path.
