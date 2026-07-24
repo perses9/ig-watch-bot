@@ -1,8 +1,26 @@
+import logging
 import os
 import sqlite3
 import threading
 
-DB_PATH = os.environ.get("DB_PATH", "watchlist.db")
+logger = logging.getLogger("ig-watch-bot")
+
+
+def _default_db_path():
+    """Prefer a mounted volume when one exists.
+
+    On a container host the working directory is rebuilt on every deploy, so a
+    database sitting there is silently destroyed each time new code ships -
+    taking every tracked account with it. /data is the conventional mount
+    point for persistent storage, so use it whenever it's actually writable.
+    """
+    for mount in ("/data", "/mnt/data"):
+        if os.path.isdir(mount) and os.access(mount, os.W_OK):
+            return os.path.join(mount, "watchlist.db")
+    return "watchlist.db"
+
+
+DB_PATH = os.environ.get("DB_PATH") or _default_db_path()
 _lock = threading.Lock()
 
 
@@ -49,6 +67,23 @@ def init_db():
         _add_column_if_missing(conn, "status", "is_private", "INTEGER")
         _add_column_if_missing(conn, "status", "profile_pic_url", "TEXT")
         _add_column_if_missing(conn, "status", "down_since", "TEXT")
+
+        watches = conn.execute("SELECT COUNT(*) FROM watches").fetchone()[0]
+        users = conn.execute("SELECT COUNT(DISTINCT chat_id) FROM watches").fetchone()[0]
+
+    absolute = os.path.abspath(DB_PATH)
+    logger.info("storage: %s — %d watch(es) across %d chat(s)", absolute, watches, users)
+
+    # On a container host, anything outside a mounted volume is wiped on every
+    # deploy. Say so loudly rather than letting watchlists vanish quietly.
+    on_volume = any(absolute.startswith(m + os.sep) for m in ("/data", "/mnt/data"))
+    if not on_volume:
+        logger.warning(
+            "DB_PATH (%s) is not on a mounted volume. If this is a container host, "
+            "every tracked account will be lost on the next deploy. Mount a volume "
+            "and point DB_PATH at it (e.g. /data/watchlist.db).",
+            absolute,
+        )
 
 
 def is_allowed_user(chat_id):
