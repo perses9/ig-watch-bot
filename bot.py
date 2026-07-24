@@ -13,7 +13,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import storage
-from ig_checker import check_instagram_status
+from ig_checker import check_instagram_status, warm_up_client
 
 BOT_COMMANDS = [
     BotCommand("watch", "Track one or more Instagram accounts"),
@@ -145,6 +145,7 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     async with httpx.AsyncClient() as client:
+        await warm_up_client(client)
         for username in usernames:
             result = await check_instagram_status(username, client)
             if result.status is None:
@@ -171,6 +172,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = clean_username(context.args[0])
 
     async with httpx.AsyncClient() as client:
+        await warm_up_client(client)
         result = await check_instagram_status(username, client)
 
     if result.status is None:
@@ -286,6 +288,7 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "check":
         await query.answer("Checking...")
         async with httpx.AsyncClient() as client:
+            await warm_up_client(client)
             result = await check_instagram_status(username, client)
         if result.status is not None:
             storage.set_confirmed(username, result.status, vars(result))
@@ -356,6 +359,7 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
     consecutive_blocks = 0
 
     async with httpx.AsyncClient() as client:
+        await warm_up_client(client)
         for username in usernames:
             result = await check_instagram_status(username, client)
             CHECKS_RUN += 1

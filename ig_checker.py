@@ -5,19 +5,24 @@ import httpx
 
 APP_ID = "936619743392459"  # public X-IG-App-ID used by instagram.com's own web client
 
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-def _headers(username: str) -> dict:
+
+def _api_headers(username: str, csrftoken: Optional[str]) -> dict:
     # Mirrors what a logged-out Chrome browser actually sends when it loads a
-    # profile page — same headers, same www.instagram.com host, real referer.
-    # The stripped-down mobile-API-style request (i.instagram.com, minimal
-    # headers) gets flagged as automated much faster than this does.
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        ),
+    # profile page — same host, same headers, real referer, and (if we have
+    # one from warm_up_client) the CSRF token cookie the page itself set.
+    # Skipping straight to the API with no prior visit/cookies is itself a
+    # bot signature real browsers never produce.
+    headers = {
+        **BROWSER_HEADERS,
         "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
         "X-IG-App-ID": APP_ID,
         "X-Requested-With": "XMLHttpRequest",
         "X-ASBD-ID": "129477",
@@ -26,6 +31,20 @@ def _headers(username: str) -> dict:
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
     }
+    if csrftoken:
+        headers["X-CSRFToken"] = csrftoken
+    return headers
+
+
+async def warm_up_client(client: httpx.AsyncClient) -> None:
+    """Visit the homepage first to pick up real session cookies (csrftoken, etc.),
+    same as what happens before any real browser ever calls the profile API.
+    Failures here are non-fatal — check_instagram_status still works without
+    cookies, just with a slightly weaker signal."""
+    try:
+        await client.get("https://www.instagram.com/", headers=BROWSER_HEADERS, timeout=10)
+    except httpx.HTTPError:
+        pass
 
 
 @dataclass
@@ -41,8 +60,9 @@ class CheckResult:
 
 async def check_instagram_status(username: str, client: httpx.AsyncClient) -> CheckResult:
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    csrftoken = client.cookies.get("csrftoken")
     try:
-        resp = await client.get(url, headers=_headers(username), timeout=10, follow_redirects=True)
+        resp = await client.get(url, headers=_api_headers(username, csrftoken), timeout=10, follow_redirects=True)
     except httpx.HTTPError as exc:
         return CheckResult(status=None, error=type(exc).__name__)
 
