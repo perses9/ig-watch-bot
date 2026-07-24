@@ -545,6 +545,99 @@ class _WalledThenThrottled(BaseHTTPRequestHandler):
         pass
 
 
+APP_SHELL = (
+    '<!DOCTYPE html><html><head><title>Instagram</title>'
+    "<style>:root, .__ig-light-mode:root {--fds-black:#000000;}</style></head><body>"
+    '<div id="react-root"></div>'
+    '<script type="application/json" data-sjs>{"result":{"data":{"user":'
+    '{"username":"someone","full_name":"Real \\u0026 Person","is_private":false,'
+    '"edge_followed_by":{"count":48231},'
+    '"profile_pic_url_hd":"https:\\/\\/cdn.example\\/pic.jpg?a=1\\u0026b=2"}}}}</script>'
+    "</body></html>"
+).encode()
+
+
+def test_embedded_json_parsing():
+    print("\nprofile data embedded in the app shell")
+    page = APP_SHELL.decode()
+
+    profile = ic._parse_embedded_json(page, "someone")
+    check("the account is found in the page's own JSON", profile is not None)
+    if profile:
+        check("name is decoded from JSON escapes", profile.get("full_name") == "Real & Person",
+              f"got {profile.get('full_name')!r}")
+        check("follower count is read", profile.get("follower_count") == 48231,
+              f"got {profile.get('follower_count')}")
+        check("picture URL is decoded", profile.get("profile_pic_url") == "https://cdn.example/pic.jpg?a=1&b=2",
+              f"got {profile.get('profile_pic_url')!r}")
+        check("private flag is read", profile.get("is_private") is False)
+
+    check("a different username doesn't match", ic._parse_embedded_json(page, "someoneelse") is None,
+          "another profile mentioned on the page must not count as this one")
+    check("matching ignores case", ic._parse_embedded_json(page, "SomeOne") is not None)
+
+
+def test_not_found_apostrophe_variants():
+    print("\n'page isn't available' in every spelling")
+    variants = [
+        ("straight quote", "Sorry, this page isn't available."),
+        ("curly quote", "Sorry, this page isn’t available."),
+        ("html entity", "Sorry, this page isn&#039;t available."),
+        ("json escape", "Sorry, this page isn\\u2019t available."),
+        ("removed wording", "the page may have been removed"),
+    ]
+    for label, text in variants:
+        check(f"detected: {label}", any(m in text for m in ic.NOT_FOUND_MARKERS), f"missed {text!r}")
+
+
+class _AppShellServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?")[0].strip("/")
+        if path == "someone":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(APP_SHELL)
+        elif path == "banned":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(
+                "<html><body>Sorry, this page isn’t available.</body></html>".encode()
+            )
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"home")
+
+    def log_message(self, *args):
+        pass
+
+
+def test_app_shell_end_to_end():
+    print("\nthe real-world app-shell response, end to end")
+    HTTPServer.allow_reuse_address = True
+    server = HTTPServer(("127.0.0.1", 0), _AppShellServer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    ic.BASE_URL = f"http://127.0.0.1:{server.server_port}"
+
+    async def run():
+        client = ic.make_client()
+        try:
+            result = await ic.check_instagram_status("someone", client)
+            check("a live account in the app shell is detected", result.status == "live",
+                  f"got {result.status or result.error}")
+            check("its details come through", result.follower_count == 48231,
+                  f"got {result.follower_count}")
+
+            result = await ic.check_instagram_status("banned", client)
+            check("a curly-quote 'not available' page reads as down", result.status == "not_found",
+                  f"got {result.status or result.error}")
+        finally:
+            await client.close()
+            server.shutdown()
+
+    asyncio.run(run())
+
+
 def test_owner_fallback_order():
     print("\nowner fallback picks the first listed ID")
     import importlib
@@ -641,6 +734,9 @@ def main():
         test_profile_data_survives_going_down,
         test_html_entities_are_decoded,
         test_rate_limit_is_not_masked,
+        test_embedded_json_parsing,
+        test_not_found_apostrophe_variants,
+        test_app_shell_end_to_end,
         test_owner_fallback_order,
         test_env_users_occupy_slots,
         test_application_assembles,

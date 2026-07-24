@@ -1,4 +1,5 @@
 import html
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -25,11 +26,15 @@ BROWSER_HEADERS = {
 
 # Text Instagram serves on the "this account doesn't exist" page. Checked
 # against the HTML body when the page returns 200 instead of a clean 404.
+#
+# Deliberately apostrophe-free: the same sentence reaches us as a straight
+# quote, a curly quote, an HTML entity, or a JSON ’ escape depending on
+# where in the page it appears, and matching one spelling missed the rest.
 NOT_FOUND_MARKERS = (
-    "Sorry, this page isn't available.",
-    "Sorry, this page isn&#039;t available.",
+    "Sorry, this page",
     "The link you followed may be broken",
     "Page Not Found",
+    "page may have been removed",
 )
 
 # Markers of the logged-out login page. Only consulted after we've already
@@ -41,6 +46,18 @@ LOGIN_WALL_MARKERS = (
     "loginForm",
     "LoginAndSignupPage",
 )
+
+# Instagram's page is a JavaScript app that ships its data as JSON inside
+# <script> tags to hydrate itself. Logged-out visitors increasingly get that
+# shell with no og: meta tags at all, so the embedded JSON is the only place
+# the profile actually appears.
+JSON_USERNAME_RE = re.compile(r'"username"\s*:\s*"([^"]+)"')
+JSON_FULL_NAME_RE = re.compile(r'"full_name"\s*:\s*"([^"]*)"')
+JSON_FOLLOWERS_RE = re.compile(
+    r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)|"follower_count"\s*:\s*(\d+)'
+)
+JSON_PROFILE_PIC_RE = re.compile(r'"profile_pic_url(?:_hd)?"\s*:\s*"([^"]+)"')
+JSON_IS_PRIVATE_RE = re.compile(r'"is_private"\s*:\s*(true|false)')
 
 OG_TITLE_RE = re.compile(r'<meta[^>]+property="og:title"[^>]+content="([^"]*)"', re.I)
 OG_DESC_RE = re.compile(r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"', re.I)
@@ -170,6 +187,47 @@ def _parse_profile_html(page: str) -> dict:
     return profile
 
 
+def _json_unescape(value: str) -> str:
+    """Decode a JSON string body (\\u0026, \\/, and friends)."""
+    try:
+        return json.loads(f'"{value}"')
+    except ValueError:
+        return value
+
+
+def _parse_embedded_json(page: str, username: str) -> Optional[dict]:
+    """Pull the profile out of the JSON the page carries to hydrate itself.
+
+    Returns None unless this specific username appears, so another account
+    mentioned somewhere on the page (a suggestion, a related profile) can't be
+    mistaken for the one being checked.
+    """
+    found = {m.group(1) for m in JSON_USERNAME_RE.finditer(page)}
+    if not any(u.lower() == username.lower() for u in found):
+        return None
+
+    profile = {}
+
+    name_match = JSON_FULL_NAME_RE.search(page)
+    if name_match and name_match.group(1).strip():
+        profile["full_name"] = _json_unescape(name_match.group(1)).strip()
+
+    followers_match = JSON_FOLLOWERS_RE.search(page)
+    if followers_match:
+        count = followers_match.group(1) or followers_match.group(2)
+        profile["follower_count"] = int(count)
+
+    pic_match = JSON_PROFILE_PIC_RE.search(page)
+    if pic_match:
+        profile["profile_pic_url"] = _json_unescape(pic_match.group(1))
+
+    private_match = JSON_IS_PRIVATE_RE.search(page)
+    if private_match:
+        profile["is_private"] = private_match.group(1) == "true"
+
+    return profile
+
+
 async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict) -> CheckResult:
     """One attempt at the public profile page. hl=en pins the response language:
     the proxy hands out IPs from random countries, and a localised page would
@@ -204,6 +262,13 @@ async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict
     profile = _parse_profile_html(page)
     if profile.get("full_name") or profile.get("follower_count") is not None:
         return CheckResult(status="live", **profile)
+
+    # No og: tags — this is the JavaScript app shell, so read the data it
+    # carries to render itself. The account existing in there is proof enough
+    # that it's live, even when none of the optional details are present.
+    embedded = _parse_embedded_json(page, username)
+    if embedded is not None:
+        return CheckResult(status="live", **embedded)
 
     # Ordering matters: only once a not-found page and real profile metadata
     # are both ruled out can login markers be trusted, since a live profile
@@ -282,6 +347,20 @@ TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 TAG_RE = re.compile(r"<[^>]+>")
 
 
+async def proxy_status(client: AsyncSession) -> dict:
+    """Whether requests are leaving through the proxy, and from which IP."""
+    info = {"configured": bool(PROXY_URL)}
+    if PROXY_URL:
+        # Show the host only — the URL carries credentials.
+        info["endpoint"] = PROXY_URL.split("@")[-1]
+    try:
+        resp = await client.get("https://ipv4.icanhazip.com", timeout=10)
+        info["exit_ip"] = (resp.text or "").strip()[:45]
+    except RequestException as exc:
+        info["exit_ip_error"] = type(exc).__name__
+    return info
+
+
 async def diagnose(username: str, client: AsyncSession) -> list:
     """Report what Instagram actually sends back, for each persona we try.
 
@@ -308,6 +387,7 @@ async def diagnose(username: str, client: AsyncSession) -> list:
         visible = TAG_RE.sub(" ", page[:4000])
         visible = " ".join(visible.split())
 
+        usernames = {m.group(1) for m in JSON_USERNAME_RE.finditer(page)}
         report.update(
             {
                 "status": resp.status_code,
@@ -316,6 +396,10 @@ async def diagnose(username: str, client: AsyncSession) -> list:
                 "title": title.group(1).strip()[:80] if title else None,
                 "og_title": bool(OG_TITLE_RE.search(page)),
                 "og_description": bool(OG_DESC_RE.search(page)),
+                "json_username_match": any(u.lower() == username.lower() for u in usernames),
+                "json_usernames_seen": len(usernames),
+                "json_full_name": bool(JSON_FULL_NAME_RE.search(page)),
+                "json_followers": bool(JSON_FOLLOWERS_RE.search(page)),
                 "not_found_marker": next((m for m in NOT_FOUND_MARKERS if m in page), None),
                 "login_marker": next((m for m in LOGIN_WALL_MARKERS if m in page), None),
                 "text": visible[:400],

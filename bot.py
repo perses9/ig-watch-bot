@@ -13,7 +13,13 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import storage
-from ig_checker import check_instagram_status, diagnose, make_client, warm_up_client
+from ig_checker import (
+    check_instagram_status,
+    diagnose,
+    make_client,
+    proxy_status,
+    warm_up_client,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ig-watch-bot")
@@ -451,10 +457,19 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔬 Probing {fmt(username)}…", parse_mode=ParseMode.HTML)
 
     client = await get_warm_client(context)
+    proxy = await proxy_status(client)
     reports = await diagnose(username, client)
     result = await check_instagram_status(username, client)
 
-    lines = [f"🔬 <b>Diagnostics for {fmt(username)}</b>"]
+    lines = [f"🔬 <b>Diagnostics for {fmt(username)}</b>", ""]
+    if proxy["configured"]:
+        lines.append(f"🌐 proxy: <b>on</b> · <code>{html.escape(proxy.get('endpoint', '?'))}</code>")
+    else:
+        lines.append("🌐 proxy: <b>OFF</b> — requests come from the server's own IP")
+    if proxy.get("exit_ip"):
+        lines.append(f"  exit IP: <code>{html.escape(proxy['exit_ip'])}</code>")
+    elif proxy.get("exit_ip_error"):
+        lines.append(f"  exit IP unknown: <code>{proxy['exit_ip_error']}</code>")
     for report in reports:
         lines.append(f"\n<b>{report['persona']}</b>")
         if report.get("error"):
@@ -468,6 +483,12 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f"  og:title {'✅' if report['og_title'] else '❌'} · "
             f"og:desc {'✅' if report['og_description'] else '❌'}"
+        )
+        lines.append(
+            f"  embedded JSON: username {'✅' if report.get('json_username_match') else '❌'} · "
+            f"name {'✅' if report.get('json_full_name') else '❌'} · "
+            f"followers {'✅' if report.get('json_followers') else '❌'} "
+            f"({report.get('json_usernames_seen', 0)} usernames in page)"
         )
         if report.get("not_found_marker"):
             lines.append(f"  not-found marker: <code>{html.escape(report['not_found_marker'])}</code>")
