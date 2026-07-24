@@ -14,6 +14,9 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 import storage
 from ig_checker import check_instagram_status, make_client, warm_up_client
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("ig-watch-bot")
+
 BOT_COMMANDS = [
     BotCommand("watch", "Track one or more Instagram accounts"),
     BotCommand("check", "Check a username's status right now"),
@@ -22,6 +25,7 @@ BOT_COMMANDS = [
     BotCommand("pause", "Mute notifications for an account"),
     BotCommand("resume", "Unmute a paused account"),
     BotCommand("uptime", "Show bot uptime and check count"),
+    BotCommand("myid", "Show your chat ID (needed to be granted access)"),
     BotCommand("help", "Show usage"),
 ]
 
@@ -31,14 +35,28 @@ CONFIRM_CHECKS = int(os.environ.get("CONFIRM_CHECKS", "2"))
 ALLOWED_CHAT_IDS = {
     int(x) for x in os.environ.get("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if x
 }
+
+
+def _resolve_owner():
+    """The owner can grant and revoke access, and never counts against the
+    guest limit. Falls back to the first ALLOWED_CHAT_IDS entry so an existing
+    deployment keeps working without having to set a new variable first."""
+    raw = os.environ.get("OWNER_CHAT_ID", "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("OWNER_CHAT_ID=%r is not a number, ignoring it", raw)
+    return min(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else None
+
+
+OWNER_CHAT_ID = _resolve_owner()
+MAX_GUEST_USERS = int(os.environ.get("MAX_GUEST_USERS", "5"))
 MAX_WATCH_PER_MESSAGE = 10
 # Re-fetching Instagram's homepage for fresh cookies on every single check is
 # wasteful, especially through a metered proxy - reuse one warm client and
 # only refresh its cookies this often instead of every check cycle.
 COOKIE_REFRESH_SECONDS = 1800
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("ig-watch-bot")
 
 START_TIME = time.monotonic()
 CHECKS_RUN = 0
@@ -58,10 +76,25 @@ HELP_TEXT = (
     "/list — see everything you're tracking, with quick-action buttons\n"
     "/remove <code>user</code> — stop tracking an account\n"
     "/pause <code>user</code> / /resume <code>user</code> — mute or unmute alerts\n"
-    "/uptime — bot health and stats\n\n"
+    "/uptime — bot health and stats\n"
+    "/myid — show your chat ID\n\n"
     f"⏱ Rechecked every <b>{CHECK_INTERVAL_SECONDS}s</b>. A change is only announced after "
     f"<b>{CONFIRM_CHECKS}</b> checks in a row agree, to avoid false alarms."
 )
+
+OWNER_HELP_TEXT = (
+    "\n\n<b>Owner commands</b>\n"
+    "/users — see who has access\n"
+    "/adduser <code>chat_id [name]</code> — grant access "
+    f"(up to {MAX_GUEST_USERS} people)\n"
+    "/removeuser <code>chat_id</code> — revoke access\n\n"
+    "<i>Everyone has their own private watchlist — guests can't see yours, "
+    "and you can't see theirs.</i>"
+)
+
+
+def help_for(chat_id: int) -> str:
+    return HELP_TEXT + (OWNER_HELP_TEXT if is_owner(chat_id) else "")
 
 
 def fmt(username: str) -> str:
@@ -124,11 +157,39 @@ async def get_warm_client(context: ContextTypes.DEFAULT_TYPE):
     return client
 
 
+def is_owner(chat_id: int) -> bool:
+    return OWNER_CHAT_ID is not None and chat_id == OWNER_CHAT_ID
+
+
+def is_authorized(chat_id: int) -> bool:
+    # With no owner and no allowlist configured the bot is open to anyone -
+    # same as before access control existed. Setting either one locks it down.
+    if OWNER_CHAT_ID is None and not ALLOWED_CHAT_IDS:
+        return True
+    if is_owner(chat_id) or chat_id in ALLOWED_CHAT_IDS:
+        return True
+    return storage.is_allowed_user(chat_id)
+
+
 def restricted(handler):
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS:
-            await update.effective_message.reply_text("You're not authorized to use this bot.")
+        if not is_authorized(update.effective_chat.id):
+            await update.effective_message.reply_text(
+                "🔒 You're not authorized to use this bot.\n"
+                "Send /myid and give that number to the bot's owner to request access."
+            )
+            return
+        return await handler(update, context)
+
+    return wrapper
+
+
+def owner_only(handler):
+    @wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_owner(update.effective_chat.id):
+            await update.effective_message.reply_text("🔒 Only the bot's owner can manage access.")
             return
         return await handler(update, context)
 
@@ -138,14 +199,15 @@ def restricted(handler):
 @restricted
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        HELP_TEXT + "\n\n👇 Try <code>/watch instagram</code> to see it in action.",
+        help_for(update.effective_chat.id)
+        + "\n\n👇 Try <code>/watch instagram</code> to see it in action.",
         parse_mode=ParseMode.HTML,
     )
 
 
 @restricted
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(help_for(update.effective_chat.id), parse_mode=ParseMode.HTML)
 
 
 @restricted
@@ -240,6 +302,105 @@ async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"You weren't tracking {fmt(username)}.", parse_mode=ParseMode.HTML)
 
 
+async def myid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Deliberately not @restricted: someone who hasn't been granted access yet
+    # needs this to find the ID they must send to the owner.
+    chat_id = update.effective_chat.id
+    status = "✅ You have access." if is_authorized(chat_id) else "🔒 You don't have access yet."
+    await update.message.reply_text(
+        f"Your chat ID is <code>{chat_id}</code>\n{status}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@owner_only
+async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /adduser <chat_id> [name]\n"
+            "Ask the person to send /myid to this bot and give you the number."
+        )
+        return
+
+    try:
+        new_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text(
+            "That doesn't look like a chat ID — it should be a number, e.g. /adduser 1363317234"
+        )
+        return
+
+    if is_owner(new_id):
+        await update.message.reply_text("That's your own ID — you already have full access.")
+        return
+
+    if storage.is_allowed_user(new_id) or new_id in ALLOWED_CHAT_IDS:
+        await update.message.reply_text("That person already has access.")
+        return
+
+    if storage.count_allowed_users() >= MAX_GUEST_USERS:
+        await update.message.reply_text(
+            f"⚠️ You've reached the limit of {MAX_GUEST_USERS} people.\n"
+            "Use /users to see who has access, and /removeuser &lt;chat_id&gt; to free up a slot.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    label = " ".join(context.args[1:]).strip() or None
+    storage.add_allowed_user(new_id, label)
+    used = storage.count_allowed_users()
+    who = f" ({html.escape(label)})" if label else ""
+    await update.message.reply_text(
+        f"✅ Access granted to <code>{new_id}</code>{who}\n"
+        f"{used} of {MAX_GUEST_USERS} slots used.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@owner_only
+async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /removeuser <chat_id>   (see /users)")
+        return
+
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("That doesn't look like a chat ID — it should be a number.")
+        return
+
+    if storage.remove_allowed_user(target):
+        used = storage.count_allowed_users()
+        await update.message.reply_text(
+            f"🚫 Access revoked for <code>{target}</code>, and their tracked accounts were removed.\n"
+            f"{used} of {MAX_GUEST_USERS} slots used.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text("That chat ID didn't have access.")
+
+
+@owner_only
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = storage.list_allowed_users()
+    lines = [f"👥 <b>Access ({len(users)} of {MAX_GUEST_USERS} slots used)</b>", ""]
+    lines.append(f"👑 <code>{OWNER_CHAT_ID}</code> — you (owner)")
+
+    for user in users:
+        label = f" — {html.escape(user['label'])}" if user.get("label") else ""
+        tracked = len(storage.list_watches(user["chat_id"]))
+        lines.append(f"• <code>{user['chat_id']}</code>{label} — tracking {tracked}")
+
+    if ALLOWED_CHAT_IDS - {OWNER_CHAT_ID}:
+        extra = ", ".join(str(i) for i in sorted(ALLOWED_CHAT_IDS - {OWNER_CHAT_ID}))
+        lines.append(f"\n<i>Also allowed via the ALLOWED_CHAT_IDS setting: {extra}</i>")
+
+    if not users:
+        lines.append("\n<i>No one else has access yet. Use /adduser &lt;chat_id&gt; to invite someone.</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 @restricted
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -278,7 +439,7 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = update.effective_chat.id
 
-    if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
+    if not is_authorized(chat_id):
         await query.answer("Not authorized.", show_alert=True)
         return
 
@@ -443,6 +604,10 @@ def main():
     app.add_handler(CommandHandler("resume", resume_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("uptime", uptime_cmd))
+    app.add_handler(CommandHandler("myid", myid_cmd))
+    app.add_handler(CommandHandler("adduser", adduser_cmd))
+    app.add_handler(CommandHandler("removeuser", removeuser_cmd))
+    app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CallbackQueryHandler(button_cmd))
 
     app.job_queue.run_repeating(check_job, interval=CHECK_INTERVAL_SECONDS, first=10)

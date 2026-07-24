@@ -36,12 +36,60 @@ def init_db():
                 updated_at TEXT
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS allowed_users (
+                chat_id INTEGER PRIMARY KEY,
+                label TEXT,
+                added_at TEXT
+            )"""
+        )
         _add_column_if_missing(conn, "watches", "paused", "INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(conn, "status", "full_name", "TEXT")
         _add_column_if_missing(conn, "status", "follower_count", "INTEGER")
         _add_column_if_missing(conn, "status", "is_private", "INTEGER")
         _add_column_if_missing(conn, "status", "profile_pic_url", "TEXT")
         _add_column_if_missing(conn, "status", "down_since", "TEXT")
+
+
+def is_allowed_user(chat_id):
+    with _lock, _conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM allowed_users WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+        return row is not None
+
+
+def count_allowed_users():
+    with _lock, _conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM allowed_users").fetchone()[0]
+
+
+def add_allowed_user(chat_id, label=None):
+    """Returns True if added, False if this user already had access."""
+    with _lock, _conn() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO allowed_users (chat_id, label, added_at)
+               VALUES (?, ?, datetime('now'))""",
+            (chat_id, label),
+        )
+        return cur.rowcount > 0
+
+
+def remove_allowed_user(chat_id):
+    """Revokes access and drops that user's watchlist, so a removed person
+    leaves nothing behind still being polled on their behalf."""
+    with _lock, _conn() as conn:
+        cur = conn.execute("DELETE FROM allowed_users WHERE chat_id=?", (chat_id,))
+        conn.execute("DELETE FROM watches WHERE chat_id=?", (chat_id,))
+        return cur.rowcount > 0
+
+
+def list_allowed_users():
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            "SELECT chat_id, label, added_at FROM allowed_users ORDER BY added_at"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def add_watch(chat_id, username):

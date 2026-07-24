@@ -38,11 +38,33 @@ from not-found back to live, everyone tracking it gets pinged immediately.
 - `/remove <username>` — stop tracking an account
 - `/pause <username>` / `/resume <username>` — mute or unmute notifications for an account without removing it
 - `/uptime` — bot uptime and how many checks it's run this session
+- `/myid` — show your own chat ID (works before you've been granted access)
 - `/help` — show usage
+
+Owner-only:
+
+- `/users` — see who currently has access
+- `/adduser <chat_id> [name]` — grant access to someone (up to `MAX_GUEST_USERS`, default 5)
+- `/removeuser <chat_id>` — revoke access, which also deletes that person's watchlist
 
 ## Access control
 
-Anyone who finds your bot's username on Telegram can message it and use every command above, by default. Since the source (and therefore the bot's behavior) is public, set `ALLOWED_CHAT_IDS` in `.env` to your own Telegram chat ID to restrict it to just you. To find your chat ID: message [@userinfobot](https://t.me/userinfobot), it replies with your ID. Comma-separate multiple IDs if more than one person should have access.
+By default anyone who finds the bot on Telegram can use it, so set `OWNER_CHAT_ID`
+to your own chat ID to lock it down. Send `/myid` to the bot to get that number.
+
+The owner can then invite up to `MAX_GUEST_USERS` other people from inside
+Telegram — no redeploy or config change needed. The person sends `/myid`, gives
+you the number, and you run `/adduser <their_id> <name>`.
+
+Guests get their own private watchlist: `/list` only ever returns rows for the
+chat that asked, and notifications only go to chats tracking that specific
+username, so guests can't see each other's accounts or yours. Guests cannot
+grant access to anyone else. Revoking someone with `/removeuser` also removes
+their tracked accounts, so nothing keeps getting polled on a revoked user's
+behalf. Note that guests do share your `PROXY_URL` bandwidth.
+
+`ALLOWED_CHAT_IDS` still works as a static allowlist and is additive to the
+invite list; if `OWNER_CHAT_ID` isn't set, its lowest entry becomes the owner.
 
 ## Setup
 
@@ -138,6 +160,8 @@ prevents a block from forming in the first place.
 | `CONFIRM_CHECKS`         | `2`              | Consecutive matching checks needed before announcing a status change |
 | `DB_PATH`                | `watchlist.db`   | SQLite file storing watchlists + status    |
 | `ALLOWED_CHAT_IDS`       | *(none)*         | Comma-separated Telegram chat IDs allowed to use the bot |
+| `OWNER_CHAT_ID`          | *(lowest allowed ID)* | Chat ID allowed to grant/revoke access via `/adduser` |
+| `MAX_GUEST_USERS`        | `5`              | How many people the owner can grant access to |
 | `PROXY_URL`              | *(none)*         | Residential/mobile proxy URL to route all Instagram requests through |
 
 ## Note on this build
