@@ -895,6 +895,54 @@ def test_application_assembles():
     check("app builds", app is not None)
 
 
+def test_api_retries_across_exit_ips():
+    print("\na refusal from one exit IP is retried on another")
+
+    class FlakyAPI(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        SHELL = b"<html><head><title>Instagram</title></head><body>shell</body></html>"
+
+        def _respond(self, code, body=b""):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_GET(self):
+            if "/api/v1/" in self.path:
+                self.server.api_calls += 1
+                # The first couple of exit IPs are refused, a later one answers.
+                if self.server.api_calls < 3:
+                    self._respond(401, b"{}")
+                else:
+                    self._respond(404, b"{}")
+            else:
+                self._respond(200, self.SHELL)
+
+        def log_message(self, *args):
+            pass
+
+    HTTPServer.allow_reuse_address = True
+    server = HTTPServer(("127.0.0.1", 0), FlakyAPI)
+    server.api_calls = 0
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    ic.BASE_URL = f"http://127.0.0.1:{server.server_port}"
+
+    async def run():
+        client = ic.make_client()
+        try:
+            result = await ic.check_instagram_status("acct", client)
+            check("a later attempt gets the real answer", result.status == "not_found",
+                  f"got {result.status or result.error} - one refusal shouldn't end the check")
+            check("it kept trying the API", server.api_calls >= 3, f"only {server.api_calls} calls")
+        finally:
+            await client.close()
+            server.shutdown()
+
+    asyncio.run(run())
+
+
 def main():
     for test in (
         test_status_transitions,
@@ -923,6 +971,7 @@ def main():
         test_not_found_apostrophe_variants,
         test_app_shell_end_to_end,
         test_api_first_is_cheap_and_definitive,
+        test_api_retries_across_exit_ips,
         test_access_approval_buttons,
         test_access_requests_are_rate_limited,
         test_owner_fallback_order,

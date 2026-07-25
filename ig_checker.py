@@ -21,10 +21,16 @@ PROXY_URL = os.environ.get("PROXY_URL") or None
 # instead of exercising a copy of the logic.
 BASE_URL = "https://www.instagram.com"
 
-# How many times to re-request the page when the answer is ambiguous.
-# Each attempt goes out through a different proxy IP, so retrying is a
-# fresh chance rather than the same request twice.
-CHECK_ATTEMPTS = int(os.environ.get("CHECK_ATTEMPTS", "2"))
+# How many times to ask the JSON API before falling back to the page. It
+# refuses from some exit IPs and answers from others, and every request
+# leaves through a different one, so retrying is a fresh chance rather than
+# the same request twice. Cheap: these responses are a few hundred bytes.
+API_ATTEMPTS = int(os.environ.get("API_ATTEMPTS", "4"))
+
+# Page attempts after that. Kept at one by default - diagnostics against the
+# live site showed the page returning a shell with no profile data in it, so
+# repeating a ~600KB fetch mostly buys bandwidth, not answers.
+CHECK_ATTEMPTS = int(os.environ.get("CHECK_ATTEMPTS", "1"))
 
 BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
@@ -506,16 +512,20 @@ async def check_instagram_status(
     actually suspended. It's also a fraction of the size, so the accurate
     path is the cheap one.
     """
-    api_result = await _check_via_api(username, client)
-    if api_result.status is not None:
-        return api_result
-    if api_result.error == "rate_limited":
-        return api_result
-
-    # The API answers 401 when it wants a login, which happens on some exit
-    # IPs. Fall back to the page, retrying once - each request leaves through
-    # a different residential IP, so it's a fresh roll rather than a repeat.
-    last = api_result
+    # The API answers 401 from some exit IPs and correctly from others, and
+    # the proxy hands out a different residential IP per request - so a refusal
+    # is worth retrying rather than giving up on. These responses are a few
+    # hundred bytes, making several attempts far cheaper than one page fetch.
+    last = None
+    for attempt in range(API_ATTEMPTS):
+        api_result = await _check_via_api(username, client)
+        if api_result.status is not None:
+            return api_result
+        if api_result.error == "rate_limited":
+            return api_result
+        last = api_result
+        if attempt < API_ATTEMPTS - 1:
+            await asyncio.sleep(0.5)
     for attempt in range(CHECK_ATTEMPTS):
         result = await _check_via_html(username, client)
         if result.status is not None:
