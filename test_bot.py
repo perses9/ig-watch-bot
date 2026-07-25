@@ -738,6 +738,91 @@ def test_api_first_is_cheap_and_definitive():
     asyncio.run(run())
 
 
+class FakeQuery:
+    def __init__(self, data, chat_id):
+        self.data = data
+        self.answers = []
+        self.edits = []
+        self.message = type("M", (), {"chat_id": chat_id})()
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append(text)
+
+    async def edit_message_text(self, text, **kwargs):
+        self.edits.append(text)
+
+    async def edit_message_caption(self, caption, **kwargs):
+        self.edits.append(caption)
+
+
+class FakeUpdate:
+    def __init__(self, data, chat_id):
+        self.callback_query = FakeQuery(data, chat_id)
+        self.effective_chat = type("C", (), {"id": chat_id})()
+
+
+class FakeAppContext:
+    def __init__(self, fake_bot):
+        self.bot = fake_bot
+        self.application = type("A", (), {"bot_data": {}})()
+
+
+def test_access_approval_buttons():
+    print("\napproving access with a button")
+    fresh_db()
+    OWNER, REQUESTER, GUEST = 1000, 7777, 2000
+
+    # The owner taps "Grant".
+    update = FakeUpdate(f"grant:{REQUESTER}", OWNER)
+    fake = FakeBot()
+    asyncio.run(bot.button_cmd(update, FakeAppContext(fake)))
+    check("granting gives that chat access", bot.is_authorized(REQUESTER))
+    check("the new user is told", any(c == REQUESTER for c, _ in fake.sent), f"messaged {fake.sent}")
+
+    # A guest must not be able to approve anyone.
+    storage.add_allowed_user(GUEST, "Guest")
+    update = FakeUpdate("grant:8888", GUEST)
+    asyncio.run(bot.button_cmd(update, FakeAppContext(FakeBot())))
+    check("a guest cannot grant access", not bot.is_authorized(8888),
+          "guests must not be able to admit people")
+    check("and is told why", any("owner" in (a or "").lower() for a in update.callback_query.answers),
+          f"answers: {update.callback_query.answers}")
+
+    # A guest must not be able to revoke anyone either.
+    update = FakeUpdate(f"revoke:{REQUESTER}", GUEST)
+    asyncio.run(bot.button_cmd(update, FakeAppContext(FakeBot())))
+    check("a guest cannot revoke access", bot.is_authorized(REQUESTER))
+
+    # The owner revokes.
+    update = FakeUpdate(f"revoke:{REQUESTER}", OWNER)
+    asyncio.run(bot.button_cmd(update, FakeAppContext(FakeBot())))
+    check("the owner can revoke", not bot.is_authorized(REQUESTER))
+
+    # Denying doesn't grant anything.
+    update = FakeUpdate("deny:9999", OWNER)
+    asyncio.run(bot.button_cmd(update, FakeAppContext(FakeBot())))
+    check("denying leaves them without access", not bot.is_authorized(9999))
+
+
+def test_access_requests_are_rate_limited():
+    print("\naccess requests can't spam the owner")
+    fresh_db()
+    bot._access_requests.clear()
+
+    class Req:
+        def __init__(self, chat_id):
+            self.effective_chat = type("C", (), {"id": chat_id})()
+            self.effective_user = type("U", (), {"full_name": "A Person", "username": "aperson"})()
+
+    fake = FakeBot()
+    context = FakeAppContext(fake)
+    for _ in range(5):
+        asyncio.run(bot.notify_owner_of_request(Req(4242), context))
+    check("the owner is only asked once", len(fake.sent) == 1, f"sent {len(fake.sent)} messages")
+    check("the request identifies the person", "A Person" in fake.sent[0][1] if fake.sent else False)
+    check("and includes their chat ID", "4242" in fake.sent[0][1] if fake.sent else False)
+
+
 def test_owner_fallback_order():
     print("\nowner fallback picks the first listed ID")
     import importlib
@@ -838,6 +923,8 @@ def main():
         test_not_found_apostrophe_variants,
         test_app_shell_end_to_end,
         test_api_first_is_cheap_and_definitive,
+        test_access_approval_buttons,
+        test_access_requests_are_rate_limited,
         test_owner_fallback_order,
         test_env_users_occupy_slots,
         test_application_assembles,

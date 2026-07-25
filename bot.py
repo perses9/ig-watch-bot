@@ -69,6 +69,9 @@ MAX_WATCH_PER_MESSAGE = 10
 # wasteful, especially through a metered proxy - reuse one warm client and
 # only refresh its cookies this often instead of every check cycle.
 COOKIE_REFRESH_SECONDS = 1800
+# Don't let someone who's been denied keep pinging the owner.
+ACCESS_REQUEST_COOLDOWN = 3600
+_access_requests = {}
 
 START_TIME = time.monotonic()
 CHECKS_RUN = 0
@@ -96,10 +99,13 @@ HELP_TEXT = (
 
 OWNER_HELP_TEXT = (
     "\n\n<b>Owner commands</b>\n"
-    "/users — see who has access\n"
+    "/users — see who has access, with a button to revoke\n"
     "/adduser <code>chat_id [name]</code> — grant access "
     f"(up to {MAX_GUEST_USERS} people)\n"
-    "/removeuser <code>chat_id</code> — revoke access\n\n"
+    "/removeuser <code>chat_id</code> — revoke access\n"
+    "/diag <code>user</code> — show what Instagram actually returns\n\n"
+    "<i>When someone messages the bot without access, you get a request here "
+    "with a button to approve them — no chat IDs to copy around.</i>\n"
     "<i>Everyone has their own private watchlist — guests can't see yours, "
     "and you can't see theirs.</i>"
 )
@@ -193,14 +199,53 @@ def is_authorized(chat_id: int) -> bool:
     return storage.is_allowed_user(chat_id)
 
 
+async def notify_owner_of_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forward an access request to the owner with approve/deny buttons, so
+    granting access is a tap rather than copying chat IDs between people."""
+    if OWNER_CHAT_ID is None:
+        return
+
+    chat_id = update.effective_chat.id
+    last_asked = _access_requests.get(chat_id)
+    if last_asked is not None and time.monotonic() - last_asked < ACCESS_REQUEST_COOLDOWN:
+        return  # already asked recently; don't let someone spam the owner
+    _access_requests[chat_id] = time.monotonic()
+
+    user = update.effective_user
+    who = html.escape(user.full_name if user else "Someone")
+    handle = f" (@{html.escape(user.username)})" if user and user.username else ""
+
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Grant access", callback_data=f"grant:{chat_id}"),
+            InlineKeyboardButton("❌ Deny", callback_data=f"deny:{chat_id}"),
+        ]]
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=(
+                f"🔔 <b>Access request</b>\n"
+                f"{who}{handle}\n"
+                f"chat ID: <code>{chat_id}</code>\n\n"
+                f"{used_guest_slots()} of {MAX_GUEST_USERS} slots in use."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Exception:
+        logger.exception("couldn't forward an access request to the owner")
+
+
 def restricted(handler):
     @wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_authorized(update.effective_chat.id):
             await update.effective_message.reply_text(
-                "🔒 You're not authorized to use this bot.\n"
-                "Send /myid and give that number to the bot's owner to request access."
+                "🔒 You don't have access to this bot yet.\n"
+                "I've let the owner know — you'll get a message here if they approve."
             )
+            await notify_owner_of_request(update, context)
             return
         return await handler(update, context)
 
@@ -428,22 +473,38 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = storage.list_allowed_users()
-    lines = [f"👥 <b>Access ({used_guest_slots()} of {MAX_GUEST_USERS} slots used)</b>", ""]
-    lines.append(f"👑 <code>{OWNER_CHAT_ID}</code> — you (owner)")
+    await update.message.reply_text(
+        f"👥 <b>Access</b> — {used_guest_slots()} of {MAX_GUEST_USERS} slots used\n"
+        f"👑 <code>{OWNER_CHAT_ID}</code> — you (owner)",
+        parse_mode=ParseMode.HTML,
+    )
 
     for user in users:
         label = f" — {html.escape(user['label'])}" if user.get("label") else ""
         tracked = len(storage.list_watches(user["chat_id"]))
-        lines.append(f"• <code>{user['chat_id']}</code>{label} — tracking {tracked}")
+        await update.message.reply_text(
+            f"<code>{user['chat_id']}</code>{label}\ntracking {tracked} account(s)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🚫 Revoke access", callback_data=f"revoke:{user['chat_id']}")]]
+            ),
+        )
 
     for chat_id in sorted(env_guest_ids()):
         tracked = len(storage.list_watches(chat_id))
-        lines.append(f"• <code>{chat_id}</code> — via ALLOWED_CHAT_IDS — tracking {tracked}")
+        await update.message.reply_text(
+            f"<code>{chat_id}</code> — granted by the ALLOWED_CHAT_IDS setting\n"
+            f"tracking {tracked} account(s)\n"
+            "<i>Remove them from that variable to revoke.</i>",
+            parse_mode=ParseMode.HTML,
+        )
 
-    if not users:
-        lines.append("\n<i>No one else has access yet. Use /adduser &lt;chat_id&gt; to invite someone.</i>")
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    if not users and not env_guest_ids():
+        await update.message.reply_text(
+            "No one else has access yet. When someone messages the bot you'll get a "
+            "request here with a button to approve them — or use /adduser &lt;chat_id&gt;.",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @owner_only
@@ -583,6 +644,62 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     action, _, username = query.data.partition(":")
+
+    # Access decisions are the owner's alone — checked separately from the
+    # general authorisation above, since a guest passes that check too.
+    if action in ("grant", "deny", "revoke"):
+        if not is_owner(chat_id):
+            await query.answer("Only the owner can manage access.", show_alert=True)
+            return
+        try:
+            target = int(username)
+        except ValueError:
+            await query.answer()
+            return
+
+        if action == "deny":
+            await query.answer("Denied")
+            await edit_result_message(query, f"❌ Denied access to <code>{target}</code>.")
+            return
+
+        if action == "revoke":
+            storage.remove_allowed_user(target)
+            await query.answer("Access revoked")
+            await edit_result_message(
+                query,
+                f"🚫 Revoked <code>{target}</code>, and removed their tracked accounts.\n"
+                f"{used_guest_slots()} of {MAX_GUEST_USERS} slots in use.",
+            )
+            return
+
+        if storage.is_allowed_user(target) or target in ALLOWED_CHAT_IDS:
+            await query.answer("They already have access")
+            await edit_result_message(query, f"✅ <code>{target}</code> already has access.")
+            return
+
+        if used_guest_slots() >= MAX_GUEST_USERS:
+            await query.answer("No slots left", show_alert=True)
+            await edit_result_message(
+                query,
+                f"⚠️ All {MAX_GUEST_USERS} slots are in use. Free one with /users first.",
+            )
+            return
+
+        storage.add_allowed_user(target)
+        await query.answer("Access granted")
+        await edit_result_message(
+            query,
+            f"✅ Granted access to <code>{target}</code>.\n"
+            f"{used_guest_slots()} of {MAX_GUEST_USERS} slots in use.",
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target,
+                text="✅ You've been granted access. Send /help to get started.",
+            )
+        except Exception:
+            logger.info("granted %s but couldn't message them", target)
+        return
 
     if action == "remove":
         storage.remove_watch(chat_id, username)
