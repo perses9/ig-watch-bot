@@ -968,6 +968,46 @@ def test_owner_alerts_are_rate_limited():
     check("a separate issue is reported separately", len(fake.sent) == 2, f"sent {len(fake.sent)}")
 
 
+def test_direct_fallback_when_proxy_dies():
+    print("\nthe bot keeps trying when the proxy dies")
+    calls = []
+    original_api, original_direct = ic._check_via_api, ic._try_direct
+
+    async def dead_proxy(username, client):
+        calls.append("proxied")
+        return ic.CheckResult(status=None, error="ProxyError")
+
+    async def direct_works(username):
+        calls.append("direct")
+        return ic.CheckResult(status="not_found")
+
+    async def direct_fails(username):
+        calls.append("direct")
+        return None
+
+    async def run():
+        ic._check_via_api = dead_proxy
+        try:
+            ic._try_direct = direct_works
+            calls.clear()
+            result = await ic.check_instagram_status("acct", object())
+            check("an answer still comes back without the proxy", result.status == "not_found",
+                  f"got {result.status or result.error}")
+            check("it tried a direct connection", "direct" in calls, f"path: {calls}")
+            check("and didn't hammer the dead proxy", calls.count("proxied") == 1,
+                  f"made {calls.count('proxied')} proxied attempts")
+
+            ic._try_direct = direct_fails
+            calls.clear()
+            result = await ic.check_instagram_status("acct", object())
+            check("when that fails too, the proxy error is reported honestly",
+                  result.error == "ProxyError", f"got {result.status or result.error}")
+        finally:
+            ic._check_via_api, ic._try_direct = original_api, original_direct
+
+    asyncio.run(run())
+
+
 def main():
     for test in (
         test_status_transitions,
@@ -997,6 +1037,7 @@ def main():
         test_app_shell_end_to_end,
         test_api_first_is_cheap_and_definitive,
         test_api_retries_across_exit_ips,
+        test_direct_fallback_when_proxy_dies,
         test_error_messages_are_actionable,
         test_owner_alerts_are_rate_limited,
         test_access_approval_buttons,

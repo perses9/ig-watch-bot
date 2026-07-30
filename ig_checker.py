@@ -1,6 +1,7 @@
 import asyncio
 import html
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -8,6 +9,8 @@ from typing import Optional
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException
+
+logger = logging.getLogger("ig-watch-bot")
 
 APP_ID = "936619743392459"  # public X-IG-App-ID used by instagram.com's own web client
 
@@ -154,6 +157,32 @@ def _api_headers(username: str, csrftoken: Optional[str]) -> dict:
     if csrftoken:
         headers["X-CSRFToken"] = csrftoken
     return headers
+
+
+ALLOW_DIRECT_FALLBACK = os.environ.get("ALLOW_DIRECT_FALLBACK", "1") not in ("0", "false", "False")
+
+
+async def _try_direct(username: str) -> Optional["CheckResult"]:
+    """Last resort when the proxy is unreachable: ask without it.
+
+    Instagram treats datacenter IPs harshly, so this usually fails - but the
+    alternative is a bot that goes completely blind the moment the proxy
+    provider runs out of traffic, which is exactly when you'd most want to
+    know an account came back. A long shot beats nothing.
+    """
+    if not ALLOW_DIRECT_FALLBACK:
+        return None
+
+    client = AsyncSession(impersonate="chrome136")
+    try:
+        result = await _check_via_api(username, client)
+        if result.status is not None:
+            return result
+    except RequestException:
+        return None
+    finally:
+        await client.close()
+    return None
 
 
 def make_client() -> AsyncSession:
@@ -523,6 +552,16 @@ async def check_instagram_status(
             return api_result
         if api_result.error == "rate_limited":
             return api_result
+
+        # The proxy itself is down, so every further request through it fails
+        # the same way. Try once without it rather than going blind.
+        if api_result.error == "ProxyError":
+            direct = await _try_direct(username)
+            if direct is not None:
+                logger.info("%s: proxy down, answered on a direct connection", username)
+                return direct
+            return api_result
+
         last = api_result
         if attempt < API_ATTEMPTS - 1:
             await asyncio.sleep(0.5)
