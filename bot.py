@@ -493,6 +493,41 @@ async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def revoke_access(target: int) -> str:
+    """Revoke, and describe what actually happened rather than what we tried.
+
+    Deleting the database row is not the same as removing access. Someone
+    listed in ALLOWED_CHAT_IDS is authorised by the environment, so the delete
+    succeeds, the watchlist goes, and they walk straight back in on their next
+    message. Reporting "access revoked" there is worse than reporting a
+    failure, because the owner stops looking."""
+    removed = storage.remove_allowed_user(target)
+    slots = f"{used_guest_slots()} of {MAX_GUEST_USERS} slots in use."
+
+    if is_owner(target):
+        return (
+            f"⚠️ <code>{target}</code> is the owner (<code>OWNER_CHAT_ID</code>) and keeps "
+            "full access. Change that setting if you meant to hand the bot over."
+        )
+
+    if target in ALLOWED_CHAT_IDS:
+        cleared = " Their tracked accounts were removed." if removed else ""
+        return (
+            f"⚠️ <b>Not fully revoked.</b>{cleared}\n"
+            f"<code>{target}</code> is listed in <code>ALLOWED_CHAT_IDS</code>, which grants "
+            "access on its own — they'll be let back in on their next message.\n\n"
+            "Remove them from that variable in your hosting dashboard and redeploy to "
+            "finish revoking."
+        )
+
+    if removed:
+        return (
+            f"🚫 Access revoked for <code>{target}</code>, and their tracked accounts "
+            f"were removed.\n{slots}"
+        )
+    return f"That chat ID didn't have access.\n{slots}"
+
+
 @owner_only
 async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -505,25 +540,7 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("That doesn't look like a chat ID — it should be a number.")
         return
 
-    if storage.remove_allowed_user(target):
-        used = used_guest_slots()
-        await update.message.reply_text(
-            f"🚫 Access revoked for <code>{target}</code>, and their tracked accounts were removed.\n"
-            f"{used} of {MAX_GUEST_USERS} slots used.",
-            parse_mode=ParseMode.HTML,
-        )
-    elif target in ALLOWED_CHAT_IDS:
-        # Granted by the ALLOWED_CHAT_IDS setting, so there's no database row
-        # to delete - saying "didn't have access" would be a lie, since they
-        # still do.
-        await update.message.reply_text(
-            f"⚠️ <code>{target}</code> was granted access by the <code>ALLOWED_CHAT_IDS</code> "
-            "setting, so I can't revoke it from here. Remove them from that variable in your "
-            "hosting dashboard instead.",
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await update.message.reply_text("That chat ID didn't have access.")
+    await update.message.reply_text(revoke_access(target), parse_mode=ParseMode.HTML)
 
 
 @owner_only
@@ -829,13 +846,14 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "revoke":
-            storage.remove_allowed_user(target)
-            await query.answer("Access revoked")
-            await edit_result_message(
-                query,
-                f"🚫 Revoked <code>{target}</code>, and removed their tracked accounts.\n"
-                f"{used_guest_slots()} of {MAX_GUEST_USERS} slots in use.",
+            message = revoke_access(target)
+            # The toast is the only feedback if the message edit fails, so it
+            # must not claim success the message contradicts.
+            await query.answer(
+                "Still has access — see message" if "Not fully revoked" in message
+                else "Access revoked"
             )
+            await edit_result_message(query, message)
             return
 
         if storage.is_allowed_user(target) or target in ALLOWED_CHAT_IDS:

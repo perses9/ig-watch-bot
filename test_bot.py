@@ -1039,6 +1039,49 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_revoke_tells_the_truth():
+    print("\nrevoking says whether access actually went away")
+    fresh_db()
+    original_allowed, original_owner = bot.ALLOWED_CHAT_IDS, bot.OWNER_CHAT_ID
+    try:
+        bot.OWNER_CHAT_ID = 1
+        bot.ALLOWED_CHAT_IDS = {1, 777}
+
+        # Invited from chat: the database row is the only grant, so deleting
+        # it genuinely removes access.
+        storage.add_allowed_user(555)
+        storage.add_watch(555, "acct")
+        message = bot.revoke_access(555)
+        check("a database-granted user is revoked outright", "revoked" in message.lower())
+        check("and doesn't warn about something that didn't happen",
+              "Not fully revoked" not in message)
+        check("access really is gone", not storage.is_allowed_user(555))
+        check("and their watchlist stopped being polled",
+              "acct" not in storage.all_watched_usernames())
+
+        # In both places: the delete succeeds, so the old code reported
+        # success while the env var let them straight back in.
+        storage.add_allowed_user(777)
+        storage.add_watch(777, "theirs")
+        message = bot.revoke_access(777)
+        check("a user in both places is NOT reported as revoked",
+              "Not fully revoked" in message,
+              "the delete succeeds but ALLOWED_CHAT_IDS still grants access")
+        check("the message names the variable to edit", "ALLOWED_CHAT_IDS" in message)
+        check("their watchlist is still cleared", "theirs" not in storage.all_watched_usernames())
+        check("and they demonstrably still have access", bot.is_authorized(777),
+              "which is exactly why claiming success here would be a lie")
+
+        message = bot.revoke_access(1)
+        check("the owner can't be revoked by accident", "owner" in message.lower())
+        check("and keeps access", bot.is_authorized(1))
+
+        message = bot.revoke_access(99999)
+        check("an unknown chat ID is reported as such", "didn't have access" in message)
+    finally:
+        bot.ALLOWED_CHAT_IDS, bot.OWNER_CHAT_ID = original_allowed, original_owner
+
+
 def test_owner_can_see_every_watchlist():
     print("\nthe owner can enumerate every polled account")
     fresh_db()
@@ -1155,6 +1198,7 @@ def test_early_exit_does_not_starve_the_tail():
 
 def main():
     for test in (
+        test_revoke_tells_the_truth,
         test_owner_can_see_every_watchlist,
         test_watch_counts_by_chat,
         test_proxy_failures_are_distinguishable,
