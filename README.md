@@ -21,7 +21,7 @@ problem the original version of this bot suffered from.
 
 **Retried across exit IPs.** That endpoint answers from some residential IPs
 and returns `401` from others. Since the proxy hands out a different IP per
-request, a refusal is retried (`API_ATTEMPTS`, default 4) rather than treated
+request, a refusal is retried (`API_ATTEMPTS`, default 6) rather than treated
 as failure. These responses are a few hundred bytes, so retrying is cheap.
 
 **The profile page is a fallback, not the primary.** Logged-out visitors now
@@ -31,6 +31,14 @@ checker reads both the `og:` tags and the JSON the page ships to hydrate
 itself. Worth knowing: `/diag` against a real suspended account showed the
 page returning a 600KB shell with zero usernames in it while the API
 correctly answered 404.
+
+**A HEAD probe is the tiebreaker.** When the API refuses from every exit IP
+and the page is a shell, a headers-only request still settles the common case:
+Instagram answers `404` for an account that's gone. Only the 404 is trusted — a
+`200` has been observed for an account that was in fact suspended — so it can
+resolve "it's down" without ever being able to wrongly claim "it's live". It
+runs before the page fetch, so confirming a suspended account usually costs
+under a kilobyte.
 
 **Nothing is guessed.** A blocked, throttled, or ambiguous response is
 reported as a check issue and the last confirmed status is kept — the bot
@@ -64,6 +72,7 @@ Owner-only:
 - `/users` — who has access, each with a revoke button
 - `/adduser <chat_id> [name]` — grant access (up to `MAX_GUEST_USERS`)
 - `/removeuser <chat_id>` — revoke access and delete their watchlist
+- `/allwatches` — every account being polled and whose list it's on
 - `/diag <username>` — what Instagram actually returned: status codes, page
   size, which markers matched, proxy exit IP. This is the tool to reach for
   when a check misbehaves; it turns "inconclusive" into something readable.
@@ -210,7 +219,7 @@ docker run -d --env-file .env -v $(pwd)/data:/data ig-watch-bot
 | `LIVE_CHECK_SECONDS` | `21600` | How often live accounts are rechecked (6h) |
 | `PROXY_COST_PER_GB` | `6.00` | Your real per-GB rate, for the `/uptime` projection |
 | `CONFIRM_CHECKS` | `2` | Agreeing checks needed before announcing a change |
-| `API_ATTEMPTS` | `4` | API retries across exit IPs before falling back to the page |
+| `API_ATTEMPTS` | `6` | API retries across exit IPs before falling back to the page |
 | `CHECK_ATTEMPTS` | `1` | Page fetch attempts after the API gives up |
 | `ALLOWED_CHAT_IDS` | *(none)* | Static allowlist, comma-separated |
 | `MAX_GUEST_USERS` | `5` | How many people the owner can invite |
@@ -222,7 +231,7 @@ docker run -d --env-file .env -v $(pwd)/data:/data ig-watch-bot
 python test_bot.py
 ```
 
-162 checks, no test dependencies. Covers status transitions and the debounce,
+209 checks, no test dependencies. Covers status transitions and the debounce,
 alert delivery and targeting, watchlist isolation between users, the access
 model (including that guests can't grant themselves access), every kind of
 Instagram response, cost shortcuts, and database upgrades from older schemas.
@@ -235,7 +244,7 @@ behaviour they check was once broken in a way that silently lost alerts.
 | Symptom | Cause |
 |---|---|
 | `ProxyError` everywhere, `/diag` can't get an exit IP | Proxy provider out of data, or bad credentials |
-| `no_profile_data` | Instagram served the empty shell; the API refused on those exit IPs. Usually resolves on the next cycle |
+| `no_profile_data` | Instagram served the empty shell, the API refused on every exit IP, and the HEAD probe didn't return 404 either. Usually resolves on the next cycle — the exit IPs are different each time |
 | `login_wall` | That exit IP was asked to log in. Retried automatically |
 | `rate_limited` | Throttled; the bot backs off and ends the cycle early |
 | `/list` empty after a deploy | The database wasn't on a mounted volume |

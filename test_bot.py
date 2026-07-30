@@ -1039,6 +1039,66 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_head_probe_rescues_an_inconclusive_check():
+    print("\na cheap HEAD probe answers when the API and page don't")
+
+    class ShellOnly(BaseHTTPRequestHandler):
+        """The situation that produced 'no_profile_data' in the wild: the API
+        refuses from every exit IP, and the page is a shell with nothing in
+        it. Only the HEAD request tells the truth."""
+        protocol_version = "HTTP/1.1"
+        SHELL = b"<html><head><title>Instagram</title></head><body>x</body></html>"
+
+        def _respond(self, code, body=b"", head_only=False):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body and not head_only:
+                self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.server.head_calls += 1
+            self._respond(404, head_only=True)
+
+        def do_GET(self):
+            if "/api/v1/" in self.path:
+                self.server.api_calls += 1
+                self._respond(401, b"{}")
+            else:
+                self.server.page_calls += 1
+                self._respond(200, self.SHELL)
+
+        def log_message(self, *args):
+            pass
+
+    HTTPServer.allow_reuse_address = True
+    server = HTTPServer(("127.0.0.1", 0), ShellOnly)
+    server.api_calls = server.page_calls = server.head_calls = 0
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    original_base, original_attempts = ic.BASE_URL, ic.API_ATTEMPTS
+    ic.BASE_URL = f"http://127.0.0.1:{server.server_port}"
+    ic.API_ATTEMPTS = 2  # keep the test quick; the behaviour is the same
+
+    async def run():
+        client = ic.make_client()
+        try:
+            result = await ic.check_instagram_status("acct", client)
+            check("the check resolves instead of giving up",
+                  result.status == "not_found",
+                  f"got {result.status or result.error} - this is the case that "
+                  "surfaced as 'Instagram returned a page with no profile data'")
+            check("the HEAD probe was actually consulted", server.head_calls >= 1)
+            check("and it ran before spending 600KB on the page",
+                  server.page_calls == 0,
+                  "the whole point is that the cheap signal comes first")
+        finally:
+            await client.close()
+            server.shutdown()
+            ic.BASE_URL, ic.API_ATTEMPTS = original_base, original_attempts
+
+    asyncio.run(run())
+
+
 def test_check_button_always_shows_something():
     print("\nthe Check now button always visibly responds")
     fresh_db()
@@ -1251,6 +1311,7 @@ def test_early_exit_does_not_starve_the_tail():
 
 def main():
     for test in (
+        test_head_probe_rescues_an_inconclusive_check,
         test_check_button_always_shows_something,
         test_revoke_tells_the_truth,
         test_owner_can_see_every_watchlist,

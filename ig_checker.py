@@ -24,11 +24,13 @@ PROXY_URL = os.environ.get("PROXY_URL") or None
 # instead of exercising a copy of the logic.
 BASE_URL = "https://www.instagram.com"
 
-# How many times to ask the JSON API before falling back to the page. It
-# refuses from some exit IPs and answers from others, and every request
-# leaves through a different one, so retrying is a fresh chance rather than
-# the same request twice. Cheap: these responses are a few hundred bytes.
-API_ATTEMPTS = int(os.environ.get("API_ATTEMPTS", "4"))
+# How many times to ask the JSON API before falling back. It refuses from
+# some exit IPs and answers from others, and every request leaves through a
+# different one, so retrying is a fresh chance rather than the same request
+# twice. Cheap: these responses are a few hundred bytes, so six attempts still
+# cost a fraction of one page fetch - and every attempt that lands is one
+# fewer "couldn't verify" the user has to look at.
+API_ATTEMPTS = int(os.environ.get("API_ATTEMPTS", "6"))
 
 # Page attempts after that. Kept at one by default - diagnostics against the
 # live site showed the page returning a shell with no profile data in it, so
@@ -598,6 +600,22 @@ async def check_instagram_status(
         last = api_result
         if attempt < API_ATTEMPTS - 1:
             await asyncio.sleep(0.5)
+
+    # Before spending ~600KB on a page that increasingly carries no profile
+    # data at all, ask for headers only. A 404 here is definitive and costs
+    # almost nothing, which matters because "suspended" is the state this bot
+    # spends nearly all its time confirming.
+    #
+    # Only the 404 is trusted. A 200 has been observed for an account that was
+    # actually suspended, so anything else means "keep looking" rather than
+    # "it's live" - the asymmetry is the whole reason this is safe to consult.
+    probe = await _probe_exists(username, client)
+    if probe.status == "not_found":
+        logger.info("%s: API inconclusive, HEAD probe answered 404", username)
+        return probe
+    if probe.error == "rate_limited":
+        return probe
+
     for attempt in range(CHECK_ATTEMPTS):
         result = await _check_via_html(username, client)
         if result.status is not None:
