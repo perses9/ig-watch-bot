@@ -579,6 +579,8 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  exit IP: <code>{html.escape(proxy['exit_ip'])}</code>")
     elif proxy.get("exit_ip_error"):
         lines.append(f"  exit IP unknown: <code>{proxy['exit_ip_error']}</code>")
+        if proxy.get("exit_ip_detail"):
+            lines.append(f"  ↳ {html.escape(proxy['exit_ip_detail'])}")
     for report in reports:
         lines.append(f"\n<b>{report['persona']}</b>")
         if report.get("head_verdict") is not None:
@@ -586,6 +588,8 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         if report.get("error"):
             lines.append(f"  request failed: <code>{report['error']}</code>")
+            if report.get("error_detail"):
+                lines.append(f"  ↳ {html.escape(report['error_detail'])}")
             continue
         lines.append(f"  HTTP <b>{report['status']}</b> · {report['bytes']:,} bytes")
         if report.get("location"):

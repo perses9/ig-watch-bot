@@ -1039,6 +1039,27 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_proxy_failures_are_distinguishable():
+    print("\nproxy failures say which failure they are")
+    reason = ic.proxy_failure_reason
+
+    # These three arrive as the same 'ProxyError' class name but need
+    # opposite responses, and only one of them is fixed by paying.
+    check("bad credentials are named as credentials",
+          "credential" in reason(Exception("Received HTTP code 407 from proxy after CONNECT")).lower(),
+          "adding funds never fixes a 407, so it must not read as a balance problem")
+    check("a 403 points at the plan, not the password",
+          "traffic" in reason(Exception("HTTP/1.1 403 Forbidden")).lower())
+    check("an unreachable endpoint is named as such",
+          "connection" in reason(Exception("Failed to connect to proxy: Connection refused")).lower())
+    check("a bad hostname is named as such",
+          "resolve" in reason(Exception("Could not resolve proxy: geo.iproyal.cm")).lower())
+    check("an unrecognised message is passed through rather than swallowed",
+          "wobble" in reason(Exception("some novel wobble")))
+    check("an empty message still returns something printable",
+          reason(Exception("")).strip() != "")
+
+
 def test_early_exit_does_not_starve_the_tail():
     print("\na cycle that ends early resumes where it stopped")
     accounts = ["a", "b", "c", "d", "e"]
@@ -1069,6 +1090,7 @@ def test_early_exit_does_not_starve_the_tail():
 
 def main():
     for test in (
+        test_proxy_failures_are_distinguishable,
         test_early_exit_does_not_starve_the_tail,
         test_status_transitions,
         test_debounce,

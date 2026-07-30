@@ -466,7 +466,39 @@ async def proxy_status(client: AsyncSession) -> dict:
         info["exit_ip"] = (resp.text or "").strip()[:45]
     except RequestException as exc:
         info["exit_ip_error"] = type(exc).__name__
+        info["exit_ip_detail"] = proxy_failure_reason(exc)
     return info
+
+
+def proxy_failure_reason(exc: Exception) -> str:
+    """Turn a proxy-layer exception into something you can act on.
+
+    Every proxy failure arrives as the same 'ProxyError' class name, but the
+    causes need opposite responses: wrong credentials, an account with no
+    traffic left, and an unreachable endpoint all look identical while only
+    one of them is fixed by adding money. The underlying message does say
+    which - it just never reached the user."""
+    text = str(exc)
+    low = text.lower()
+    if "407" in low or "authentication" in low or "authorization" in low:
+        return (
+            "the proxy rejected the username/password (407). Check PROXY_URL "
+            "credentials — note that adding funds does not change them."
+        )
+    if "403" in low or "forbidden" in low:
+        return (
+            "the proxy accepted the login but refused the request (403). Usually "
+            "means the plan has no traffic left, or the target host isn't allowed "
+            "on your plan."
+        )
+    if "could not resolve" in low or "name or service" in low or "dns" in low:
+        return "the proxy hostname doesn't resolve. Check the endpoint spelling."
+    if "refused" in low or "timed out" in low or "timeout" in low or "connect" in low:
+        return (
+            "couldn't open a connection to the proxy at all. Check the host and "
+            "port, and that the plan is active."
+        )
+    return text[:200] if text else "no detail returned by the proxy layer."
 
 
 async def diagnose(username: str, client: AsyncSession) -> list:
@@ -498,6 +530,7 @@ async def diagnose(username: str, client: AsyncSession) -> list:
             )
         except RequestException as exc:
             report["error"] = type(exc).__name__
+            report["error_detail"] = proxy_failure_reason(exc)
             reports.append(report)
             continue
 
