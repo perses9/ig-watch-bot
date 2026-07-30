@@ -1039,8 +1039,37 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_early_exit_does_not_starve_the_tail():
+    print("\na cycle that ends early resumes where it stopped")
+    accounts = ["a", "b", "c", "d", "e"]
+
+    bot._resume_after = None
+    check("a fresh cycle starts at the top", bot.cycle_order(accounts) == accounts)
+
+    # The proxy died on "b", so the cycle broke there having never reached
+    # c, d or e. Restarting from "a" every time is what left them unchecked.
+    bot._resume_after = "b"
+    check("the next cycle starts after the account it stopped on",
+          bot.cycle_order(accounts) == ["c", "d", "e", "a", "b"],
+          "otherwise the accounts past the break point are never checked at all")
+
+    bot._resume_after = "e"
+    check("stopping on the last account wraps to the front",
+          bot.cycle_order(accounts) == ["a", "b", "c", "d", "e"])
+
+    # Someone removed the account the cursor pointed at between cycles.
+    bot._resume_after = "gone"
+    check("a stale cursor falls back to the top instead of raising",
+          bot.cycle_order(accounts) == accounts)
+
+    check("every account still appears exactly once",
+          sorted(bot.cycle_order(accounts)) == sorted(accounts))
+    bot._resume_after = None
+
+
 def main():
     for test in (
+        test_early_exit_does_not_starve_the_tail,
         test_status_transitions,
         test_debounce,
         test_profile_data_preserved,

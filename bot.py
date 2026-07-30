@@ -87,6 +87,9 @@ LIVE_CHECK_SECONDS = int(os.environ.get("LIVE_CHECK_SECONDS", "21600"))
 # writing; override if yours differs.
 PROXY_COST_PER_GB = float(os.environ.get("PROXY_COST_PER_GB", "1.75"))
 _last_checked = {}
+# Where the next cycle should start, when the last one exited early. See
+# cycle_order().
+_resume_after = None
 
 START_TIME = time.monotonic()
 CHECKS_RUN = 0
@@ -925,16 +928,38 @@ async def apply_check_result(context: ContextTypes.DEFAULT_TYPE, username: str, 
     return True
 
 
+def cycle_order(usernames: list) -> list:
+    """Start each cycle where the last one left off.
+
+    A cycle can end early - the proxy is down, or Instagram rate limited us
+    twice in a row - and it always walked the list in the same order, so the
+    accounts near the end were never reached. Not "checked late": never
+    checked, cycle after cycle, because the next cycle started from the top
+    and hit the same wall in the same place. With a handful of accounts you'd
+    never see it; with twenty and Instagram throttling, most of the watchlist
+    is silently unmonitored.
+
+    Rotating the start point turns that into an even delay for everyone
+    instead of starvation for whoever sorts last."""
+    if _resume_after is None or _resume_after not in usernames:
+        return usernames
+    cut = usernames.index(_resume_after) + 1
+    return usernames[cut:] + usernames[:cut]
+
+
 async def check_job(context: ContextTypes.DEFAULT_TYPE):
-    global CHECKS_RUN
+    global CHECKS_RUN, _resume_after
     usernames = storage.all_watched_usernames()
     if not usernames:
         return
 
     consecutive_blocks = 0
     client = await get_warm_client(context)
+    # A cycle that runs to the end has no unfinished business; only an early
+    # exit needs to hand a starting point to the next one.
+    _resume_after = None
 
-    for username in usernames:
+    for username in cycle_order(usernames):
         if not due_for_check(username):
             continue
         _last_checked[username] = time.monotonic()
@@ -954,6 +979,7 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
                 "This usually means the IPRoyal balance has run out — worth checking your "
                 "dashboard.",
             )
+            _resume_after = username
             break
 
         if result.error == "rate_limited":
@@ -963,6 +989,7 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
             # cycle is only CHECK_INTERVAL_SECONDS away anyway.
             if consecutive_blocks >= 2:
                 logger.warning("rate limited repeatedly, ending this cycle early")
+                _resume_after = username
                 break
             await asyncio.sleep(5)
         else:
