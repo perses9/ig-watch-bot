@@ -38,7 +38,12 @@ BOT_COMMANDS = [
 ]
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "60"))
+# How often DOWN accounts are rechecked. This is where nearly all the request
+# volume goes, since most of a watchlist is usually down. 5 minutes rather
+# than 1: you're waiting on a reinstatement that takes days or weeks, so
+# hearing about it 4 minutes later costs nothing, and it cuts both the proxy
+# bill and the request rate that gets you rate limited by a factor of 5.
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))
 CONFIRM_CHECKS = int(os.environ.get("CONFIRM_CHECKS", "2"))
 # Order is preserved: the fallback owner is whoever is listed first, which
 # would be wrong if this were a set - group chat IDs are large negative
@@ -83,9 +88,11 @@ _owner_alerts = {}
 # profile for a live account and a tiny 404 for a missing one.
 LIVE_CHECK_SECONDS = int(os.environ.get("LIVE_CHECK_SECONDS", "21600"))
 # What the proxy provider charges, used only to turn projected GB into a
-# number that means something. IPRoyal residential is $1.75/GB at time of
-# writing; override if yours differs.
-PROXY_COST_PER_GB = float(os.environ.get("PROXY_COST_PER_GB", "1.75"))
+# number that means something. Use the rate on the tier you actually buy, not
+# the headline price: IPRoyal advertises $1.75/GB but that's a bulk rate, and
+# small orders run $6-7/GB. Guessing low here is worse than not showing a
+# figure at all.
+PROXY_COST_PER_GB = float(os.environ.get("PROXY_COST_PER_GB", "6.00"))
 _last_checked = {}
 # Where the next cycle should start, when the last one exited early. See
 # cycle_order().

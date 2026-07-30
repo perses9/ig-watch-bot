@@ -4,7 +4,7 @@ Telegram bot that watches Instagram accounts and messages you the moment a
 suspended one comes back online.
 
 Built for the case where you're waiting on an account to be reinstated: it
-polls the ones that are down every minute, and pings you with the profile
+polls the ones that are down every few minutes, and pings you with the profile
 photo, name, follower count, and how long it was gone.
 
 ## How it detects status
@@ -99,23 +99,31 @@ practice. Set `PROXY_URL` to a rotating residential endpoint, e.g.
 `http://user:pass@geo.iproyal.com:12321`. Prefer per-request rotation over
 sticky sessions.
 
-Cost is driven almost entirely by **whether an account is up**, because the
-API returns a few hundred bytes for a missing account and a full profile for
-a live one:
+Budget on the rate you'll actually pay, not the advertised one. IPRoyal
+headlines $1.75/GB, but that's a bulk tier — a 1 GB order is $7 and 2 GB is
+$12, so small buyers are really paying **$6–7/GB**. Set `PROXY_COST_PER_GB` to
+your real rate or `/uptime` will flatter you.
 
-| | data per check | 3 accounts, per month |
+Cost is driven by how many accounts are **down**, since those are the ones on
+the fast cycle:
+
+| | data per check | 20 accounts, per month |
 |---|---|---|
-| account is down | ~1 KB | ~0.12 GB (~$0.21 at $1.75/GB) |
-| account is live | ~15 KB | ~1.85 GB (~$3.20) *if* checked every 60s |
+| account is down, 5 min cycle | ~1 KB | ~0.17 GB (~$1.00 at $6/GB) |
+| account is down, 1 min cycle | ~1 KB | ~0.86 GB (~$5.20) |
+| account is live, 6 h cycle | ~15 KB | ~0.02 GB (~$0.12) |
 
-So live accounts are polled on a much slower cycle (`LIVE_CHECK_SECONDS`,
-default 6 hours), which drops them to a few cents a month. Down accounts stay
-on the fast cycle, since catching a reinstatement quickly is the whole point —
-and it's the cheap direction anyway.
+The asymmetry is deliberate. A suspended account coming back is the event
+you're waiting for, so those are polled on `CHECK_INTERVAL_SECONDS` (default 5
+min). A live account going down is worth knowing but not worth paying to watch,
+so those go on `LIVE_CHECK_SECONDS` (default 6 h) — a full profile is ~15× the
+bytes of a 404.
 
-The asymmetry is deliberate: a down account coming back is the event you're
-waiting for, so it's polled every minute. A live account going down is worth
-knowing but not worth paying to watch, so it's polled every 6 hours.
+Dropping the down-account cycle from 60s to 5 min is the single biggest lever
+on the bill, and it costs almost nothing in practice: reinstatements take days
+or weeks, so hearing about one four minutes later changes nothing. It also cuts
+the request rate by 5×, which matters because Instagram rate limits a
+watchlist of twenty accounts polled every minute.
 
 `/uptime` reports data used and projects monthly GB and cost. Watch it for
 the first day rather than trusting the estimate above.
@@ -198,9 +206,9 @@ docker run -d --env-file .env -v $(pwd)/data:/data ig-watch-bot
 | `OWNER_CHAT_ID` | *(first allowed ID)* | Chat allowed to grant/revoke access |
 | `DB_PATH` | `/data/watchlist.db` if mounted, else `watchlist.db` | SQLite file |
 | `PROXY_URL` | *(none)* | Residential proxy for all Instagram requests |
-| `CHECK_INTERVAL_SECONDS` | `60` | How often down accounts are rechecked |
+| `CHECK_INTERVAL_SECONDS` | `300` | How often down accounts are rechecked |
 | `LIVE_CHECK_SECONDS` | `21600` | How often live accounts are rechecked (6h) |
-| `PROXY_COST_PER_GB` | `1.75` | Price used for the `/uptime` cost projection |
+| `PROXY_COST_PER_GB` | `6.00` | Your real per-GB rate, for the `/uptime` projection |
 | `CONFIRM_CHECKS` | `2` | Agreeing checks needed before announcing a change |
 | `API_ATTEMPTS` | `4` | API retries across exit IPs before falling back to the page |
 | `CHECK_ATTEMPTS` | `1` | Page fetch attempts after the API gives up |
