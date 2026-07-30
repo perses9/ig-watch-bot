@@ -1039,6 +1039,41 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_owner_can_see_every_watchlist():
+    print("\nthe owner can enumerate every polled account")
+    fresh_db()
+    storage.add_watch(1000, "mine")
+    storage.add_watch(2000, "theirs")
+    storage.add_watch(2000, "theirs_two")
+    storage.set_paused(2000, "theirs_two", True)
+
+    rows = storage.all_watches_detailed()
+    check("every watch row is returned, not just one chat's", len(rows) == 3)
+    check("rows carry the owning chat", {r["chat_id"] for r in rows} == {1000, 2000})
+    check("rows carry the username", {r["username"] for r in rows} ==
+          {"mine", "theirs", "theirs_two"})
+    check("mute state survives the round trip",
+          [r["paused"] for r in rows if r["username"] == "theirs_two"] == [True])
+    check("grouped by chat so output doesn't interleave",
+          [r["chat_id"] for r in rows] == sorted(r["chat_id"] for r in rows))
+
+    # Two people watching the same account is one check, not two - the
+    # distinction matters because the owner is being told what it costs.
+    storage.add_watch(3000, "mine")
+    rows = storage.all_watches_detailed()
+    check("a shared account appears once per watcher", len(rows) == 4)
+    check("but counts once toward what's actually polled",
+          len(storage.all_watched_usernames()) == 3)
+
+    long_list = [f"line {i}" * 20 for i in range(200)]
+    chunks = bot.chunk_lines(long_list)
+    check("a long watchlist is split into sendable messages",
+          all(len(c) <= 3500 for c in chunks) and len(chunks) > 1,
+          "Telegram rejects >4096 chars, and a long list is when this matters most")
+    check("splitting loses no lines",
+          sum(c.count("\n") + 1 for c in chunks) == len(long_list))
+
+
 def test_watch_counts_by_chat():
     print("\nthe owner can see whose accounts they're paying to poll")
     fresh_db()
@@ -1120,6 +1155,7 @@ def test_early_exit_does_not_starve_the_tail():
 
 def main():
     for test in (
+        test_owner_can_see_every_watchlist,
         test_watch_counts_by_chat,
         test_proxy_failures_are_distinguishable,
         test_early_exit_does_not_starve_the_tail,

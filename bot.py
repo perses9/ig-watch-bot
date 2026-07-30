@@ -128,11 +128,13 @@ OWNER_HELP_TEXT = (
     "/adduser <code>chat_id [name]</code> — grant access "
     f"(up to {MAX_GUEST_USERS} people)\n"
     "/removeuser <code>chat_id</code> — revoke access\n"
+    "/allwatches — every account being polled, and whose list it's on\n"
     "/diag <code>user</code> — show what Instagram actually returns\n\n"
     "<i>When someone messages the bot without access, you get a request here "
     "with a button to approve them — no chat IDs to copy around.</i>\n"
-    "<i>Everyone has their own private watchlist — guests can't see yours, "
-    "and you can't see theirs.</i>"
+    "<i>Guests each have a private watchlist and can't see yours or each "
+    "other's. You can see all of them via /allwatches — they're polled with "
+    "your proxy data, so they're your bill.</i>"
 )
 
 
@@ -559,6 +561,67 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "request here with a button to approve them — or use /adduser &lt;chat_id&gt;.",
             parse_mode=ParseMode.HTML,
         )
+
+
+@owner_only
+async def allwatches_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Every account being polled, and who it belongs to.
+
+    /list is scoped to the asking chat, which is right for guests but leaves
+    the owner unable to see what their proxy data is being spent on - only a
+    total that doesn't match their own list."""
+    rows = storage.all_watches_detailed()
+    if not rows:
+        await update.message.reply_text("Nothing is being tracked by anyone.")
+        return
+
+    labels = {u["chat_id"]: u.get("label") for u in storage.list_allowed_users()}
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["chat_id"], []).append(row)
+
+    unique = len({r["username"] for r in rows})
+    await update.message.reply_text(
+        f"📋 <b>Everything being polled</b>\n"
+        f"{len(rows)} watch(es) · {unique} unique account(s) · {len(grouped)} chat(s)\n"
+        "<i>Unique accounts is what costs data — two people watching the same "
+        "username is still one check.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    for chat_id, watches in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+        if chat_id == update.effective_chat.id:
+            who = "👑 you"
+        elif labels.get(chat_id):
+            who = f"👤 {html.escape(str(labels[chat_id]))}"
+        else:
+            who = f"👤 chat {chat_id}"
+        if chat_id != OWNER_CHAT_ID and chat_id not in ALLOWED_CHAT_IDS and chat_id not in labels:
+            who += " ⚠️ <b>no longer has access</b>"
+
+        lines = [f"{who} — <code>{chat_id}</code> · {len(watches)} account(s)"]
+        for w in watches:
+            status = storage.get_state(w["username"])["confirmed_status"] or "unknown"
+            icon = {"live": "🟢", "not_found": "🔴"}.get(status, "⚪️")
+            lines.append(f"{icon} {fmt(w['username'])}{' 🔇' if w['paused'] else ''}")
+        # Telegram rejects anything over 4096 characters, and a long
+        # watchlist is exactly when this command matters most.
+        for chunk in chunk_lines(lines):
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+
+def chunk_lines(lines: list, limit: int = 3500) -> list:
+    """Group lines into messages Telegram will accept."""
+    chunks, current, size = [], [], 0
+    for line in lines:
+        if current and size + len(line) + 1 > limit:
+            chunks.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
 
 
 @owner_only
@@ -1091,6 +1154,7 @@ def main():
     app.add_handler(CommandHandler("adduser", adduser_cmd))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("allwatches", allwatches_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CallbackQueryHandler(button_cmd))
     app.add_error_handler(on_error)

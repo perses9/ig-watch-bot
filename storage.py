@@ -179,6 +179,22 @@ def watch_counts_by_chat():
         return [{"chat_id": r["chat_id"], "count": r["n"]} for r in rows]
 
 
+def all_watches_detailed():
+    """Every row in the watchlist, whoever it belongs to.
+
+    list_watches() is deliberately scoped to one chat, which means the owner
+    has no way to see the accounts their proxy data is actually being spent
+    on. Ordered by chat so the output groups naturally."""
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            "SELECT chat_id, username, paused FROM watches ORDER BY chat_id, username"
+        ).fetchall()
+        return [
+            {"chat_id": r["chat_id"], "username": r["username"], "paused": bool(r["paused"])}
+            for r in rows
+        ]
+
+
 def chats_watching(username, only_unpaused=False):
     with _lock, _conn() as conn:
         query = "SELECT chat_id FROM watches WHERE username=?"
