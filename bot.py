@@ -72,6 +72,10 @@ COOKIE_REFRESH_SECONDS = 1800
 # Don't let someone who's been denied keep pinging the owner.
 ACCESS_REQUEST_COOLDOWN = 3600
 _access_requests = {}
+# Infrastructure problems are worth telling the owner about, but not
+# every cycle.
+OWNER_ALERT_COOLDOWN = 3600
+_owner_alerts = {}
 
 START_TIME = time.monotonic()
 CHECKS_RUN = 0
@@ -138,6 +142,35 @@ def format_duration(seconds: float) -> str:
     if not parts:
         parts.append(f"{seconds}s")
     return " ".join(parts)
+
+
+ERROR_EXPLANATIONS = {
+    "ProxyError": (
+        "couldn't reach the proxy — usually means the IPRoyal balance is used up, "
+        "or the PROXY_URL credentials are wrong"
+    ),
+    "ConnectionError": "network problem reaching Instagram",
+    "ConnectTimeout": "the proxy didn't respond in time",
+    "ReadTimeout": "Instagram didn't respond in time",
+    "Timeout": "the request timed out",
+    "rate_limited": "Instagram is throttling us right now",
+    "login_wall": "Instagram demanded a login for this request",
+    "no_profile_data": "Instagram returned a page with no profile data in it",
+    "bad_json": "Instagram returned something unreadable",
+}
+
+
+def explain_error(error: str) -> str:
+    """Turn an internal error name into something actionable. These strings
+    surface directly to users, and 'ProxyError' on its own tells them nothing
+    about the thing they'd actually need to go and fix."""
+    if not error:
+        return "unknown problem"
+    if error in ERROR_EXPLANATIONS:
+        return ERROR_EXPLANATIONS[error]
+    if error.startswith("http_") or error.startswith("head_"):
+        return f"Instagram answered {error.split('_', 1)[1]}"
+    return error
 
 
 def profile_summary(state: dict) -> str:
@@ -298,8 +331,8 @@ async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.status is None:
             await update.message.reply_text(
                 f"✅ Now tracking {fmt(username)}\n"
-                f"⚪️ <b>Unknown</b> — couldn't verify right now ({result.error}), "
-                f"retrying every {CHECK_INTERVAL_SECONDS}s.",
+                f"⚪️ <b>Unknown</b> — {html.escape(explain_error(result.error))}.\n"
+                f"Retrying every {CHECK_INTERVAL_SECONDS}s.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=watch_keyboard(username, paused=False),
             )
@@ -330,7 +363,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result.status is None:
         await update.message.reply_text(
-            f"⚠️ Couldn't verify {fmt(username)} right now ({result.error}). Try again in a moment.",
+            f"⚠️ Couldn't verify {fmt(username)} — {html.escape(explain_error(result.error))}.",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -722,7 +755,7 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # that happened to catch the recovery meant nobody was ever told.
         await apply_check_result(context, username, result)
         if result.status is None:
-            await query.answer(f"Couldn't verify right now ({result.error})", show_alert=True)
+            await query.answer(explain_error(result.error), show_alert=True)
     else:
         await query.answer()
         return
@@ -798,6 +831,24 @@ async def notify_watchers(
             logger.exception("failed to notify chat %s about %s", chat_id, username)
 
 
+async def alert_owner_once(context: ContextTypes.DEFAULT_TYPE, key: str, text: str):
+    """Tell the owner about an infrastructure problem, at most hourly.
+
+    Silence looks identical to "nothing has changed" — if checks are failing
+    for everything, the owner needs to hear it rather than assume the
+    accounts are simply still down."""
+    if OWNER_CHAT_ID is None:
+        return
+    last = _owner_alerts.get(key)
+    if last is not None and time.monotonic() - last < OWNER_ALERT_COOLDOWN:
+        return
+    _owner_alerts[key] = time.monotonic()
+    try:
+        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    except Exception:
+        logger.exception("couldn't alert the owner")
+
+
 async def apply_check_result(context: ContextTypes.DEFAULT_TYPE, username: str, result) -> bool:
     """Record a check result and announce it if it's a genuine status change.
 
@@ -851,6 +902,19 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
         result = await check_instagram_status(username, client)
         CHECKS_RUN += 1
         await apply_check_result(context, username, result)
+
+        if result.error == "ProxyError":
+            # The proxy itself is unreachable, so no account can be checked -
+            # stop the cycle instead of failing through the whole list.
+            logger.error("proxy unreachable — check the provider's balance and credentials")
+            await alert_owner_once(
+                context,
+                "proxy_down",
+                "⚠️ <b>The proxy is unreachable.</b>\nChecks are failing for every account. "
+                "This usually means the IPRoyal balance has run out — worth checking your "
+                "dashboard.",
+            )
+            break
 
         if result.error == "rate_limited":
             consecutive_blocks += 1

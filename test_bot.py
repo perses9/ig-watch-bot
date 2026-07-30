@@ -943,6 +943,31 @@ def test_api_retries_across_exit_ips():
     asyncio.run(run())
 
 
+def test_error_messages_are_actionable():
+    print("\nerror messages say what to do about it")
+    proxy = bot.explain_error("ProxyError")
+    check("a proxy failure points at the balance", "balance" in proxy.lower(), f"got {proxy!r}")
+    check("and doesn't just repeat the exception name", proxy != "ProxyError")
+    check("rate limiting is explained", "throttl" in bot.explain_error("rate_limited").lower())
+    check("http codes are readable", bot.explain_error("http_500") == "Instagram answered 500",
+          f"got {bot.explain_error('http_500')!r}")
+    check("an unknown error still says something", bot.explain_error("weird_new_thing") == "weird_new_thing")
+    check("no error at all is handled", bot.explain_error(None) == "unknown problem")
+
+
+def test_owner_alerts_are_rate_limited():
+    print("\ninfrastructure alerts don't repeat every cycle")
+    bot._owner_alerts.clear()
+    fake = FakeBot()
+    context = FakeAppContext(fake)
+    for _ in range(5):
+        asyncio.run(bot.alert_owner_once(context, "proxy_down", "proxy is down"))
+    check("the owner is told once, not five times", len(fake.sent) == 1, f"sent {len(fake.sent)}")
+    check("a different problem still gets through", True)
+    asyncio.run(bot.alert_owner_once(context, "something_else", "other problem"))
+    check("a separate issue is reported separately", len(fake.sent) == 2, f"sent {len(fake.sent)}")
+
+
 def main():
     for test in (
         test_status_transitions,
@@ -972,6 +997,8 @@ def main():
         test_app_shell_end_to_end,
         test_api_first_is_cheap_and_definitive,
         test_api_retries_across_exit_ips,
+        test_error_messages_are_actionable,
+        test_owner_alerts_are_rate_limited,
         test_access_approval_buttons,
         test_access_requests_are_rate_limited,
         test_owner_fallback_order,
