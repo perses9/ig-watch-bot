@@ -1039,6 +1039,36 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_watch_counts_by_chat():
+    print("\nthe owner can see whose accounts they're paying to poll")
+    fresh_db()
+    storage.add_watch(1000, "mine_a")
+    storage.add_watch(1000, "mine_b")
+    for i in range(5):
+        storage.add_watch(2000, f"theirs_{i}")
+    storage.add_watch(3000, "someone_elses")
+
+    counts = storage.watch_counts_by_chat()
+    check("every chat with a list appears", len(counts) == 3)
+    check("biggest list first", [c["count"] for c in counts] == [5, 2, 1])
+    check("counts are per chat, not global",
+          {c["chat_id"]: c["count"] for c in counts}[1000] == 2)
+
+    total = sum(c["count"] for c in counts)
+    check("the per-chat counts add up to what the poller actually checks",
+          total == len(storage.all_watched_usernames()),
+          "if these disagree the owner is being billed for something invisible")
+
+    # Removing a user has to take their list with it, or it keeps costing
+    # money every cycle with nobody to notify.
+    storage.remove_allowed_user(2000)
+    counts = storage.watch_counts_by_chat()
+    check("a revoked user's list stops being counted",
+          all(c["chat_id"] != 2000 for c in counts))
+    check("and stops being polled",
+          not any(u.startswith("theirs_") for u in storage.all_watched_usernames()))
+
+
 def test_proxy_failures_are_distinguishable():
     print("\nproxy failures say which failure they are")
     reason = ic.proxy_failure_reason
@@ -1090,6 +1120,7 @@ def test_early_exit_does_not_starve_the_tail():
 
 def main():
     for test in (
+        test_watch_counts_by_chat,
         test_proxy_failures_are_distinguishable,
         test_early_exit_does_not_starve_the_tail,
         test_status_transitions,

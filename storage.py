@@ -166,6 +166,19 @@ def all_watched_usernames():
         return [r["username"] for r in rows]
 
 
+def watch_counts_by_chat():
+    """How many accounts each chat is tracking, biggest list first.
+
+    The owner pays for every account being polled, not just their own, so
+    "the bot says 21 but I only track 2" needs a better answer than "guests
+    have their own lists" - it needs to show whose."""
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            "SELECT chat_id, COUNT(*) AS n FROM watches GROUP BY chat_id ORDER BY n DESC"
+        ).fetchall()
+        return [{"chat_id": r["chat_id"], "count": r["n"]} for r in rows]
+
+
 def chats_watching(username, only_unpaused=False):
     with _lock, _conn() as conn:
         query = "SELECT chat_id FROM watches WHERE username=?"

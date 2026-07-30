@@ -674,6 +674,41 @@ async def uptime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     if elapsed < 900:
         lines.append("<i>Projection is rough until the bot has run a while.</i>")
+
+    # The count above is every account being polled, which is not the same as
+    # the owner's own list - and the difference is what they're paying for.
+    # Left unexplained it just reads as a wrong number.
+    if is_owner(update.effective_chat.id):
+        by_chat = storage.watch_counts_by_chat()
+        if len(by_chat) > 1:
+            labels = {u["chat_id"]: u.get("label") for u in storage.list_allowed_users()}
+            lines.append("\n<b>Who's tracking what</b>")
+            for entry in by_chat:
+                cid = entry["chat_id"]
+                if cid == update.effective_chat.id:
+                    who = "you"
+                elif labels.get(cid):
+                    who = html.escape(str(labels[cid]))
+                else:
+                    who = f"chat {cid}"
+                # A list belonging to nobody still costs money every cycle.
+                orphan = (
+                    cid != OWNER_CHAT_ID
+                    and cid not in ALLOWED_CHAT_IDS
+                    and cid not in labels
+                )
+                flag = " ⚠️ no longer has access" if orphan else ""
+                lines.append(f"  {who}: {entry['count']}{flag}")
+            if any(
+                e["chat_id"] != OWNER_CHAT_ID
+                and e["chat_id"] not in ALLOWED_CHAT_IDS
+                and e["chat_id"] not in labels
+                for e in by_chat
+            ):
+                lines.append(
+                    "<i>⚠️ lists are still polled after access is revoked via "
+                    "ALLOWED_CHAT_IDS. /removeuser &lt;chat_id&gt; clears one.</i>"
+                )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
