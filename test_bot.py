@@ -1039,6 +1039,59 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_check_button_always_shows_something():
+    print("\nthe Check now button always visibly responds")
+    fresh_db()
+    storage.add_watch(1000, "acct")
+    storage.set_confirmed("acct", "not_found")
+
+    original_check, original_client = bot.check_instagram_status, bot.get_warm_client
+
+    async def unchanged(username, client):
+        return ic.CheckResult(status="not_found")
+
+    async def failing(username, client):
+        return ic.CheckResult(status=None, error="ProxyError")
+
+    async def fake_client(context):
+        return object()
+
+    try:
+        bot.get_warm_client = fake_client
+
+        # The common case, and the one that looked broken: the status hasn't
+        # moved, so the redraw was byte-identical, Telegram refused the edit
+        # as "not modified", and the tap produced nothing at all.
+        bot.check_instagram_status = unchanged
+        first = FakeUpdate("check:acct", 1000)
+        asyncio.run(bot.button_cmd(first, FakeAppContext(FakeBot())))
+        check("an unchanged status still redraws the message",
+              bool(first.callback_query.edits),
+              "no edit at all is exactly what made the button look dead")
+        check("the redraw says when it was checked",
+              "checked" in first.callback_query.edits[-1].lower(),
+              "something must differ from the previous text or Telegram drops it")
+        check("and still shows the status", "Down" in first.callback_query.edits[-1])
+
+        # A failed check has to explain itself in the message body: Telegram
+        # honours only the first answer(), and that was already spent.
+        bot.check_instagram_status = failing
+        failed = FakeUpdate("check:acct", 1000)
+        asyncio.run(bot.button_cmd(failed, FakeAppContext(FakeBot())))
+        text = failed.callback_query.edits[-1]
+        check("a failed check reports the failure in the message", "couldn't verify" in text)
+        check("and explains it in plain language", "balance" in text.lower(),
+              "this used to go to a second answer() that Telegram silently ignored")
+        check("exactly one callback answer is sent",
+              len(failed.callback_query.answers) == 1,
+              f"sent {failed.callback_query.answers} - only the first is honoured")
+        check("a failed check doesn't overwrite the known status",
+              storage.get_state("acct")["confirmed_status"] == "not_found",
+              "an unverifiable check must not erase what we already knew")
+    finally:
+        bot.check_instagram_status, bot.get_warm_client = original_check, original_client
+
+
 def test_revoke_tells_the_truth():
     print("\nrevoking says whether access actually went away")
     fresh_db()
@@ -1198,6 +1251,7 @@ def test_early_exit_does_not_starve_the_tail():
 
 def main():
     for test in (
+        test_check_button_always_shows_something,
         test_revoke_tells_the_truth,
         test_owner_can_see_every_watchlist,
         test_watch_counts_by_chat,

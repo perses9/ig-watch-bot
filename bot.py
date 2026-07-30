@@ -891,6 +891,12 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_result_message(query, f"🗑 Stopped tracking {fmt(username)}.")
         return
 
+    # Shown under the status so a button press always changes something
+    # visible. Without it, checking an account whose status hasn't moved
+    # re-renders byte-identical text, Telegram refuses the edit as
+    # "not modified", and the tap looks like the bot is broken.
+    footer = ""
+
     if action == "pause":
         storage.set_paused(chat_id, username, True)
         await query.answer(f"Muted @{username}")
@@ -898,15 +904,21 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         storage.set_paused(chat_id, username, False)
         await query.answer(f"Unmuted @{username}")
     elif action == "check":
-        await query.answer("Checking...")
+        # Telegram wants a callback answered within seconds and only honours
+        # the first answer, so this is the one chance to respond - a check can
+        # take longer than that budget. Every other outcome goes in the text.
+        await query.answer("Checking…")
         client = await get_warm_client(context)
         result = await check_instagram_status(username, client)
         # Same transition logic as everywhere else. Writing the status
         # directly here used to consume the pending change, so a manual check
         # that happened to catch the recovery meant nobody was ever told.
         await apply_check_result(context, username, result)
+        stamp = time.strftime("%H:%M:%S UTC", time.gmtime())
         if result.status is None:
-            await query.answer(explain_error(result.error), show_alert=True)
+            footer = f"\n<i>⚠️ checked {stamp} — couldn't verify: {explain_error(result.error)}</i>"
+        else:
+            footer = f"\n<i>checked {stamp}</i>"
     else:
         await query.answer()
         return
@@ -918,7 +930,8 @@ async def button_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mute_tag = " · 🔇 muted" if paused else ""
     await edit_result_message(
         query,
-        f"{fmt(username)}\n{STATUS_LABELS.get(status, status)}{profile_summary(state)}{mute_tag}",
+        f"{fmt(username)}\n{STATUS_LABELS.get(status, status)}"
+        f"{profile_summary(state)}{mute_tag}{footer}",
         reply_markup=watch_keyboard(username, paused=paused),
     )
 
