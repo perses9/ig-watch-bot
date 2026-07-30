@@ -81,7 +81,11 @@ _owner_alerts = {}
 # a live account going down is worth knowing but not worth polling for every
 # minute - and it's the expensive direction, since the API returns a full
 # profile for a live account and a tiny 404 for a missing one.
-LIVE_CHECK_SECONDS = int(os.environ.get("LIVE_CHECK_SECONDS", "900"))
+LIVE_CHECK_SECONDS = int(os.environ.get("LIVE_CHECK_SECONDS", "21600"))
+# What the proxy provider charges, used only to turn projected GB into a
+# number that means something. IPRoyal residential is $1.75/GB at time of
+# writing; override if yours differs.
+PROXY_COST_PER_GB = float(os.environ.get("PROXY_COST_PER_GB", "1.75"))
 _last_checked = {}
 
 START_TIME = time.monotonic()
@@ -651,7 +655,8 @@ async def uptime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱ Live accounts checked every {format_duration(LIVE_CHECK_SECONDS)}",
         "",
         f"📶 Proxy data this session: <b>{used / 1048576:.1f} MB</b>",
-        f"Projected: ~{per_month_gb:.2f} GB/month (about ${per_month_gb * 6:.2f} at $6/GB)",
+        f"Projected: ~{per_month_gb:.2f} GB/month "
+        f"(about ${per_month_gb * PROXY_COST_PER_GB:.2f} at ${PROXY_COST_PER_GB:g}/GB)",
     ]
     if elapsed < 900:
         lines.append("<i>Projection is rough until the bot has run a while.</i>")

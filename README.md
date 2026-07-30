@@ -105,13 +105,17 @@ a live one:
 
 | | data per check | 3 accounts, per month |
 |---|---|---|
-| account is down | ~1 KB | ~0.12 GB (~$0.75) |
-| account is live | ~15 KB | ~1.85 GB (~$11) if checked every 60s |
+| account is down | ~1 KB | ~0.12 GB (~$0.21 at $1.75/GB) |
+| account is live | ~15 KB | ~1.85 GB (~$3.20) *if* checked every 60s |
 
 So live accounts are polled on a much slower cycle (`LIVE_CHECK_SECONDS`,
-default 15 min), which brings them to roughly the same ~$0.75/month. Down
-accounts stay on the fast cycle, since catching a reinstatement quickly is
-the whole point.
+default 6 hours), which drops them to a few cents a month. Down accounts stay
+on the fast cycle, since catching a reinstatement quickly is the whole point —
+and it's the cheap direction anyway.
+
+The asymmetry is deliberate: a down account coming back is the event you're
+waiting for, so it's polled every minute. A live account going down is worth
+knowing but not worth paying to watch, so it's polled every 6 hours.
 
 `/uptime` reports data used and projects monthly GB and cost. Watch it for
 the first day rather than trusting the estimate above.
@@ -195,7 +199,8 @@ docker run -d --env-file .env -v $(pwd)/data:/data ig-watch-bot
 | `DB_PATH` | `/data/watchlist.db` if mounted, else `watchlist.db` | SQLite file |
 | `PROXY_URL` | *(none)* | Residential proxy for all Instagram requests |
 | `CHECK_INTERVAL_SECONDS` | `60` | How often down accounts are rechecked |
-| `LIVE_CHECK_SECONDS` | `900` | How often live accounts are rechecked |
+| `LIVE_CHECK_SECONDS` | `21600` | How often live accounts are rechecked (6h) |
+| `PROXY_COST_PER_GB` | `1.75` | Price used for the `/uptime` cost projection |
 | `CONFIRM_CHECKS` | `2` | Agreeing checks needed before announcing a change |
 | `API_ATTEMPTS` | `4` | API retries across exit IPs before falling back to the page |
 | `CHECK_ATTEMPTS` | `1` | Page fetch attempts after the API gives up |
