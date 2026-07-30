@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
@@ -1008,6 +1009,36 @@ def test_direct_fallback_when_proxy_dies():
     asyncio.run(run())
 
 
+def test_live_accounts_are_polled_less_often():
+    print("\nlive accounts aren't re-fetched every minute")
+    fresh_db()
+    bot._last_checked.clear()
+    storage.add_watch(1000, "downacct")
+    storage.add_watch(1000, "liveacct")
+    storage.set_confirmed("downacct", "not_found")
+    storage.set_confirmed("liveacct", "live", {"full_name": "Up"})
+
+    check("a down account is checked immediately", bot.due_for_check("downacct"))
+    check("so is a live one that's never been checked", bot.due_for_check("liveacct"))
+
+    bot._last_checked["downacct"] = time.monotonic()
+    bot._last_checked["liveacct"] = time.monotonic()
+
+    check("a down account is still due on the next cycle", bot.due_for_check("downacct"),
+          "waiting for a suspended account to return is the point - keep it fast")
+    check("a live account is not", not bot.due_for_check("liveacct"),
+          "re-downloading a live profile every minute is where the proxy bill goes")
+
+    bot._last_checked["liveacct"] = time.monotonic() - bot.LIVE_CHECK_SECONDS - 1
+    check("but it is checked again after the longer interval", bot.due_for_check("liveacct"))
+
+    # An unknown account must not inherit the slow path.
+    storage.add_watch(1000, "unknownacct")
+    bot._last_checked["unknownacct"] = time.monotonic()
+    check("an unverified account is checked every cycle", bot.due_for_check("unknownacct"),
+          "it hasn't been established as live, so it can't take the cheap path")
+
+
 def main():
     for test in (
         test_status_transitions,
@@ -1037,6 +1068,7 @@ def main():
         test_app_shell_end_to_end,
         test_api_first_is_cheap_and_definitive,
         test_api_retries_across_exit_ips,
+        test_live_accounts_are_polled_less_often,
         test_direct_fallback_when_proxy_dies,
         test_error_messages_are_actionable,
         test_owner_alerts_are_rate_limited,

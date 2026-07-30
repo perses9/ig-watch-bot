@@ -76,6 +76,13 @@ _access_requests = {}
 # every cycle.
 OWNER_ALERT_COOLDOWN = 3600
 _owner_alerts = {}
+# An account that's already live is checked far less often than one that's
+# down. The event worth catching quickly is a suspended account coming back;
+# a live account going down is worth knowing but not worth polling for every
+# minute - and it's the expensive direction, since the API returns a full
+# profile for a live account and a tiny 404 for a missing one.
+LIVE_CHECK_SECONDS = int(os.environ.get("LIVE_CHECK_SECONDS", "900"))
+_last_checked = {}
 
 START_TIME = time.monotonic()
 CHECKS_RUN = 0
@@ -630,15 +637,24 @@ async def uptime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hours = max(elapsed / 3600, 1 / 60)
     per_day = used / hours * 24
 
+    per_month_gb = per_day * 30 / 1073741824
+    tracked = storage.all_watched_usernames()
+    live = sum(1 for u in tracked if storage.get_state(u)["confirmed_status"] == "live")
+
     lines = [
         "🤖 <b>Bot status</b>",
         f"Uptime: {format_duration(elapsed)}",
         f"Checks run this session: {CHECKS_RUN}",
-        f"Check interval: {CHECK_INTERVAL_SECONDS}s",
+        f"Tracking {len(tracked)} account(s) — {len(tracked) - live} down, {live} live",
+        "",
+        f"⏱ Down accounts checked every {CHECK_INTERVAL_SECONDS}s",
+        f"⏱ Live accounts checked every {format_duration(LIVE_CHECK_SECONDS)}",
         "",
         f"📶 Proxy data this session: <b>{used / 1048576:.1f} MB</b>",
-        f"At this rate: ~{per_day / 1073741824:.2f} GB/day",
+        f"Projected: ~{per_month_gb:.2f} GB/month (about ${per_month_gb * 6:.2f} at $6/GB)",
     ]
+    if elapsed < 900:
+        lines.append("<i>Projection is rough until the bot has run a while.</i>")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -831,6 +847,21 @@ async def notify_watchers(
             logger.exception("failed to notify chat %s about %s", chat_id, username)
 
 
+def due_for_check(username: str) -> bool:
+    """Down accounts are checked every cycle; live ones much less often.
+
+    Waiting for a suspended account to come back is the whole point, so that
+    direction stays fast. The reverse - a live account going down - still gets
+    caught, just not within a minute, and skipping those checks is where
+    nearly all the proxy bill goes: the API returns a full profile for a live
+    account and a few hundred bytes for a missing one.
+    """
+    if storage.get_state(username)["confirmed_status"] != "live":
+        return True
+    last = _last_checked.get(username)
+    return last is None or time.monotonic() - last >= LIVE_CHECK_SECONDS
+
+
 async def alert_owner_once(context: ContextTypes.DEFAULT_TYPE, key: str, text: str):
     """Tell the owner about an infrastructure problem, at most hourly.
 
@@ -899,6 +930,10 @@ async def check_job(context: ContextTypes.DEFAULT_TYPE):
     client = await get_warm_client(context)
 
     for username in usernames:
+        if not due_for_check(username):
+            continue
+        _last_checked[username] = time.monotonic()
+
         result = await check_instagram_status(username, client)
         CHECKS_RUN += 1
         await apply_check_result(context, username, result)
