@@ -1,96 +1,163 @@
 # ig-watch-bot
 
-Telegram bot that watches Instagram usernames and tells you when they go
-offline (banned / suspended / deactivated) and when they come back.
+Telegram bot that watches Instagram accounts and messages you the moment a
+suspended one comes back online.
 
-## Why this fixes the "session expired" problem
+Built for the case where you're waiting on an account to be reinstated: it
+polls the ones that are down every minute, and pings you with the profile
+photo, name, follower count, and how long it was gone.
 
-The previous version apparently used a logged-in Instagram session
-(cookies / instagrapi-style login). Instagram actively invalidates those
-sessions — especially when hit repeatedly from automation — which is why it
-kept expiring and throwing `401`s.
+## How it detects status
 
-This version never logs in. It calls Instagram's own public web endpoint
-(`i.instagram.com/api/v1/users/web_profile_info`) the same way a logged-out
-browser visiting `instagram.com/<username>` does, using the public
-`X-IG-App-ID` header the website itself uses. There is no session to expire.
+Instagram makes this harder than it sounds, and the approach here is the
+result of finding out what actually works against the live site rather than
+what ought to.
 
-Trade-off: without a login, Instagram can't tell you *why* a profile isn't
-reachable (never existed vs. banned vs. deactivated vs. deleted) — it just
-returns "not found" in all of those cases. The bot reports this as
-`not found / suspended / deactivated`.
+**The JSON API is checked first** —
+`instagram.com/api/v1/users/web_profile_info`. It answers `404` for an
+account that's suspended, deactivated, or gone, and returns the full profile
+when it's live. No login required, so there's no session to expire — the
+problem the original version of this bot suffered from.
+
+**Retried across exit IPs.** That endpoint answers from some residential IPs
+and returns `401` from others. Since the proxy hands out a different IP per
+request, a refusal is retried (`API_ATTEMPTS`, default 4) rather than treated
+as failure. These responses are a few hundred bytes, so retrying is cheap.
+
+**The profile page is a fallback, not the primary.** Logged-out visitors now
+get a ~600KB JavaScript shell that frequently contains *no profile data at
+all* — no `og:` meta tags, no embedded JSON. When it does carry data, the
+checker reads both the `og:` tags and the JSON the page ships to hydrate
+itself. Worth knowing: `/diag` against a real suspended account showed the
+page returning a 600KB shell with zero usernames in it while the API
+correctly answered 404.
+
+**Nothing is guessed.** A blocked, throttled, or ambiguous response is
+reported as a check issue and the last confirmed status is kept — the bot
+never invents a status change it isn't sure about.
 
 ## How status changes are decided
 
-Every `CHECK_INTERVAL_SECONDS` (default 30s) the bot rechecks every watched
-username. A single failed/blocked check does **not** flip the reported
-status — it's logged and the last confirmed status is kept, so a transient
-block doesn't spam you with false alarms. A status only changes after it's
-seen consistently for `CONFIRM_CHECKS` checks in a row (default 2, i.e.
-confirmed within ~1 minute at the default interval). When an account flips
-from not-found back to live, everyone tracking it gets pinged immediately.
+A status only changes after `CONFIRM_CHECKS` checks in a row agree (default
+2), so one flaky response can't fire a false "back online!" alert. Every path
+that checks an account — the background loop, `/watch`, and the 🔍 Check now
+button — runs through the same logic, so a manual check can't silently
+consume the alert the background loop was about to send.
+
+The first time an account resolves it's recorded silently as a baseline.
+Nothing changed; the bot just learned where things stand, and announcing that
+would be noise.
 
 ## Commands
 
-- `/watch <username> [username2 ...]` — start tracking one or more accounts (checked immediately)
-- `/check <username>` — check status right now, without waiting for the next cycle or adding it to your list
-- `/list` — show tracked accounts, status, follower count, and mute state
-- `/remove <username>` — stop tracking an account
-- `/pause <username>` / `/resume <username>` — mute or unmute notifications for an account without removing it
-- `/uptime` — bot uptime and how many checks it's run this session
-- `/myid` — show your own chat ID (works before you've been granted access)
-- `/help` — show usage
+- `/watch <username> [username2 ...]` — start tracking one or more accounts
+- `/check <username>` — check right now, without adding it to your list
+- `/list` — everything you're tracking, with quick-action buttons
+- `/remove <username>` — stop tracking
+- `/pause <username>` / `/resume <username>` — mute or unmute alerts
+- `/uptime` — health, data usage, and projected monthly proxy cost
+- `/myid` — your chat ID (works before you've been granted access)
+- `/help` — usage
 
 Owner-only:
 
-- `/users` — see who currently has access
-- `/adduser <chat_id> [name]` — grant access to someone (up to `MAX_GUEST_USERS`, default 5)
-- `/removeuser <chat_id>` — revoke access, which also deletes that person's watchlist
+- `/users` — who has access, each with a revoke button
+- `/adduser <chat_id> [name]` — grant access (up to `MAX_GUEST_USERS`)
+- `/removeuser <chat_id>` — revoke access and delete their watchlist
+- `/diag <username>` — what Instagram actually returned: status codes, page
+  size, which markers matched, proxy exit IP. This is the tool to reach for
+  when a check misbehaves; it turns "inconclusive" into something readable.
 
 ## Access control
 
-By default anyone who finds the bot on Telegram can use it, so set `OWNER_CHAT_ID`
-to your own chat ID to lock it down. Send `/myid` to the bot to get that number.
+Set `OWNER_CHAT_ID` to your own chat ID to lock the bot down — without it (or
+`ALLOWED_CHAT_IDS`) anyone who finds the bot can use it.
 
-The owner can then invite up to `MAX_GUEST_USERS` other people from inside
-Telegram — no redeploy or config change needed. The person sends `/myid`, gives
-you the number, and you run `/adduser <their_id> <name>`.
+When someone without access messages the bot, **the owner gets a request with
+Grant / Deny buttons**, showing their name and chat ID. One tap admits them
+and tells them they're in. No copying IDs between people. Requests are rate
+limited so a denied user can't pester you.
 
-Guests get their own private watchlist: `/list` only ever returns rows for the
-chat that asked, and notifications only go to chats tracking that specific
-username, so guests can't see each other's accounts or yours. Guests cannot
-grant access to anyone else. Revoking someone with `/removeuser` also removes
-their tracked accounts, so nothing keeps getting polled on a revoked user's
-behalf. Note that guests do share your `PROXY_URL` bandwidth.
+Guests get their own private watchlist: `/list` only returns rows for the
+chat that asked, and notifications only reach chats tracking that specific
+username — guests can't see your accounts or each other's. Guests can neither
+grant nor revoke access; that check is separate from ordinary authorisation,
+since a guest passes that. Revoking someone also deletes their watchlist, so
+nothing keeps being polled on their behalf.
+
+Guests do share your `PROXY_URL` data allowance.
 
 `ALLOWED_CHAT_IDS` still works as a static allowlist and is additive to the
-invite list; if `OWNER_CHAT_ID` isn't set, its lowest entry becomes the owner.
+invite list. If `OWNER_CHAT_ID` isn't set, the *first* entry becomes the owner
+(order matters — group chat IDs are large negative numbers).
+
+## Proxy, and what it costs
+
+Instagram blocks datacenter IP ranges — Railway, any VPS, AWS — regardless of
+how browser-like the request looks. A residential proxy is not optional in
+practice. Set `PROXY_URL` to a rotating residential endpoint, e.g.
+`http://user:pass@geo.iproyal.com:12321`. Prefer per-request rotation over
+sticky sessions.
+
+Cost is driven almost entirely by **whether an account is up**, because the
+API returns a few hundred bytes for a missing account and a full profile for
+a live one:
+
+| | data per check | 3 accounts, per month |
+|---|---|---|
+| account is down | ~1 KB | ~0.12 GB (~$0.75) |
+| account is live | ~15 KB | ~1.85 GB (~$11) if checked every 60s |
+
+So live accounts are polled on a much slower cycle (`LIVE_CHECK_SECONDS`,
+default 15 min), which brings them to roughly the same ~$0.75/month. Down
+accounts stay on the fast cycle, since catching a reinstatement quickly is
+the whole point.
+
+`/uptime` reports data used and projects monthly GB and cost. Watch it for
+the first day rather than trusting the estimate above.
+
+**If the proxy runs out of data** every request fails with `ProxyError` — the
+exit-IP probe in `/diag` fails too, which is how you tell it apart from
+Instagram blocking you. The bot messages the owner when this happens, since
+silence would otherwise look identical to "all accounts still down". It also
+attempts one direct (unproxied) request as a long shot; set
+`ALLOW_DIRECT_FALLBACK=0` to disable that.
 
 ## Setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and grab the token.
-2. Copy `.env.example` to `.env` and fill in `BOT_TOKEN`.
-3. Install deps and run:
+2. Copy `.env.example` to `.env`, fill in `BOT_TOKEN` and `OWNER_CHAT_ID`.
+3. Install and run:
 
    ```bash
    python3 -m venv venv && source venv/bin/activate
    pip install -r requirements.txt
-   export $(cat .env | xargs)   # or use a process manager / systemd EnvironmentFile
+   export $(cat .env | xargs)
    python bot.py
    ```
 
-The bot uses long polling, so it just needs outbound internet — no public
-URL or webhook needed.
+Long polling, so it only needs outbound internet — no public URL or webhook.
 
-## Running it 24/7 (VPS, recommended for tight polling)
+## Deploying
 
-A small always-on VPS (Hetzner CX22 ~€4/mo, DigitalOcean basic droplet
-~$6/mo) is the best fit if you want a short poll interval: flat-rate
-pricing regardless of how often you poll, no cold starts, and full control
-if you later add proxy rotation to poll faster. Ubuntu 22.04/24.04 steps:
+### Railway (or any container host)
+
+Connect the repo and deploy as a worker (uses the included `Procfile`). Set
+the environment variables, then **mount a volume at `/data` and set
+`DB_PATH=/data/watchlist.db`**.
+
+That volume is not optional. Without it the database lives in the container
+filesystem, which is rebuilt on every deploy — so shipping any code change
+silently wipes every tracked account. The bot logs its database path and
+watch count at startup and warns loudly when it isn't on a volume:
+
+```
+storage: /data/watchlist.db — 3 watch(es) across 1 chat(s)
+```
+
+### VPS
 
 ```bash
-# on the VPS, as root
 apt update && apt install -y python3-venv git
 useradd --system --create-home --shell /usr/sbin/nologin igwatch
 
@@ -100,77 +167,63 @@ python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 
 cp .env.example .env
-nano .env               # fill in BOT_TOKEN, adjust CHECK_INTERVAL_SECONDS
+nano .env
 chown -R igwatch:igwatch /opt/ig-watch-bot
 
 cp deploy/ig-watch-bot.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now ig-watch-bot
-
-# check it's running / watch logs live
-systemctl status ig-watch-bot
 journalctl -u ig-watch-bot -f
 ```
 
-`Restart=on-failure` in the unit file means it comes back up if it crashes,
-and `enable` means it starts automatically on VPS reboot. To deploy an
-update later: `git pull`, `./venv/bin/pip install -r requirements.txt` (if
-deps changed), `systemctl restart ig-watch-bot`.
+`Restart=on-failure` brings it back after a crash; `enable` starts it on
+boot. To update: `git pull && systemctl restart ig-watch-bot`.
 
-## Alternative: Railway / Render (less ops, worse fit for frequent polling)
-
-Connect this GitHub repo, set `BOT_TOKEN` as an env var, deploy as a
-"worker" (uses the included `Procfile`). Zero server maintenance, but
-usage-based billing scales worse the more aggressively you poll, and some
-tiers sleep idle workers. Add a persistent volume mounted at the working
-directory if you want the watchlist (`watchlist.db`) to survive redeploys —
-otherwise it resets to empty on each deploy but survives normal restarts.
-
-## Docker (either host)
+### Docker
 
 ```bash
 docker build -t ig-watch-bot .
-docker run -d --env-file .env -v $(pwd)/data:/app ig-watch-bot
+docker run -d --env-file .env -v $(pwd)/data:/data ig-watch-bot
 ```
-
-## Rate-limit note
-
-Instagram treats datacenter IPs (Railway, any VPS, AWS, etc.) with much more
-suspicion than home/mobile connections, and can block a whole hosting
-provider's IP range outright regardless of how browser-like the requests
-look. The checker already does what's possible on the request side (real
-browser headers, session-cookie warmup, matching the exact host/endpoint a
-logged-out browser uses) and backs off automatically on `429`s — but if
-Instagram has flagged the IP range itself, no request-shaping fixes it.
-
-The actual fix at that point is a residential/mobile proxy: set `PROXY_URL`
-(see `.env.example`) to a provider's proxy endpoint and every request routes
-through a real residential/mobile IP instead of the server's own. Bright
-Data, Oxylabs, Smartproxy, and IPRoyal all offer this; pricing is usage-based,
-typically $10-50+/mo depending on volume. Prefer a per-request rotating IP
-plan over a sticky one, since a fresh IP on every check is exactly what
-prevents a block from forming in the first place.
 
 ## Environment variables
 
-| Variable                | Default          | Meaning                                   |
-|--------------------------|------------------|--------------------------------------------|
-| `BOT_TOKEN`              | *required*       | Telegram bot token from BotFather          |
-| `CHECK_INTERVAL_SECONDS` | `15`             | How often every watched account is rechecked |
-| `CONFIRM_CHECKS`         | `2`              | Consecutive matching checks needed before announcing a status change |
-| `DB_PATH`                | `watchlist.db`   | SQLite file storing watchlists + status    |
-| `ALLOWED_CHAT_IDS`       | *(none)*         | Comma-separated Telegram chat IDs allowed to use the bot |
-| `OWNER_CHAT_ID`          | *(lowest allowed ID)* | Chat ID allowed to grant/revoke access via `/adduser` |
-| `MAX_GUEST_USERS`        | `5`              | How many people the owner can grant access to |
-| `PROXY_URL`              | *(none)*         | Residential/mobile proxy URL to route all Instagram requests through |
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOT_TOKEN` | *required* | Telegram bot token from BotFather |
+| `OWNER_CHAT_ID` | *(first allowed ID)* | Chat allowed to grant/revoke access |
+| `DB_PATH` | `/data/watchlist.db` if mounted, else `watchlist.db` | SQLite file |
+| `PROXY_URL` | *(none)* | Residential proxy for all Instagram requests |
+| `CHECK_INTERVAL_SECONDS` | `60` | How often down accounts are rechecked |
+| `LIVE_CHECK_SECONDS` | `900` | How often live accounts are rechecked |
+| `CONFIRM_CHECKS` | `2` | Agreeing checks needed before announcing a change |
+| `API_ATTEMPTS` | `4` | API retries across exit IPs before falling back to the page |
+| `CHECK_ATTEMPTS` | `1` | Page fetch attempts after the API gives up |
+| `ALLOWED_CHAT_IDS` | *(none)* | Static allowlist, comma-separated |
+| `MAX_GUEST_USERS` | `5` | How many people the owner can invite |
+| `ALLOW_DIRECT_FALLBACK` | `1` | Try unproxied when the proxy is unreachable |
 
-## Note on this build
+## Tests
 
-This code was written and syntax/import-checked in a sandboxed environment
-whose network policy blocks direct requests to Instagram's domains, so the
-live Instagram response handling could not be exercised end-to-end here.
-The endpoint and headers used are the standard, widely-used approach for
-unauthenticated Instagram profile lookups. Test it against a couple of real
-usernames (a live one and a known-suspended one) right after your first
-deploy to confirm status detection matches what you expect, and ping me
-with the results if anything looks off.
+```bash
+python test_bot.py
+```
+
+162 checks, no test dependencies. Covers status transitions and the debounce,
+alert delivery and targeting, watchlist isolation between users, the access
+model (including that guests can't grant themselves access), every kind of
+Instagram response, cost shortcuts, and database upgrades from older schemas.
+
+Worth running before any deploy — several of these exist because the
+behaviour they check was once broken in a way that silently lost alerts.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `ProxyError` everywhere, `/diag` can't get an exit IP | Proxy provider out of data, or bad credentials |
+| `no_profile_data` | Instagram served the empty shell; the API refused on those exit IPs. Usually resolves on the next cycle |
+| `login_wall` | That exit IP was asked to log in. Retried automatically |
+| `rate_limited` | Throttled; the bot backs off and ends the cycle early |
+| `/list` empty after a deploy | The database wasn't on a mounted volume |
+| Everything reads Unknown | Check `/uptime` and `/diag` — usually the proxy |
