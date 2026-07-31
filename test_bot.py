@@ -1039,6 +1039,48 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_head_requests_are_not_counted_as_full_pages():
+    print("\na HEAD request isn't billed as the body it never sent")
+
+    class Resp:
+        def __init__(self, length):
+            self.headers = {"content-length": str(length)}
+            self.text = ""
+
+    ic._bytes_used = 0
+    ic._bytes_by_path.clear()
+
+    # Instagram answers a HEAD for a profile page with Content-Length ~600KB
+    # describing a body it does not transfer. Counting it made the cheapest
+    # request in the bot look like the most expensive one.
+    ic._count_response(Resp(600_000), "head-probe", body_transferred=False)
+    head_cost = ic.bytes_used()
+    check("a HEAD costs overhead only, not the declared length",
+          head_cost < 2000, f"counted {head_cost:,} bytes for a headers-only request")
+
+    ic._bytes_used = 0
+    ic._bytes_by_path.clear()
+    ic._count_response(Resp(600_000), "page")
+    check("a real page fetch still counts its body",
+          ic.bytes_used() > 500_000, f"counted {ic.bytes_used():,}")
+
+    ic._bytes_used = 0
+    ic._bytes_by_path.clear()
+    ic._count_response(Resp(800), "api")
+    ic._count_response(Resp(600_000), "page")
+    ic._count_response(Resp(600_000), "head-probe", body_transferred=False)
+    paths = ic.bytes_by_path()
+    check("usage is attributed per request type", set(paths) == {"api", "page", "head-probe"})
+    check("the biggest consumer is listed first", list(paths)[0] == "page",
+          "the point is to name the path worth fixing")
+    check("the parts add up to the total", sum(paths.values()) == ic.bytes_used())
+    check("the HEAD probe is the cheapest line, not the dearest",
+          paths["head-probe"] < paths["api"] + 1000 and paths["head-probe"] < paths["page"])
+
+    ic._bytes_used = 0
+    ic._bytes_by_path.clear()
+
+
 def test_head_probe_rescues_an_inconclusive_check():
     print("\na cheap HEAD probe answers when the API and page don't")
 
@@ -1311,6 +1353,7 @@ def test_early_exit_does_not_starve_the_tail():
 
 def main():
     for test in (
+        test_head_requests_are_not_counted_as_full_pages,
         test_head_probe_rescues_an_inconclusive_check,
         test_check_button_always_shows_something,
         test_revoke_tells_the_truth,

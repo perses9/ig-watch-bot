@@ -45,28 +45,46 @@ BROWSER_HEADERS = {
 # bot is pulling. Surfaced by /uptime to make the burn rate visible before
 # it shows up as an empty balance.
 _bytes_used = 0
+# Same total, split by which request produced it. A single number can only
+# say the bill is too high; this says which path to go and fix.
+_bytes_by_path = {}
 
 
-def _count_response(resp) -> None:
+def _count_response(resp, path: str = "other", body_transferred: bool = True) -> None:
     """Count what crossed the wire, not what we ended up with.
 
     Responses arrive gzipped, and the decoded text is several times larger
     than the transfer the proxy actually bills for - counting the decoded
     length overstates usage badly enough to be misleading.
+
+    body_transferred=False is for HEAD requests. The server still sends a
+    Content-Length describing the body it *would* have returned - ~600KB for
+    an Instagram profile page - while transferring none of it. Counting that
+    made the cheapest request in the bot look like the most expensive one,
+    and turned a working setup into an apparent $77/month emergency.
     """
     global _bytes_used
-    declared = resp.headers.get("content-length")
-    if declared and declared.isdigit():
-        _bytes_used += int(declared)
-    else:
-        # No Content-Length (chunked): fall back to the decoded body with a
-        # rough compression factor, since that's the best estimate available.
-        _bytes_used += len(resp.text or "") // 4
-    _bytes_used += 400  # request headers, TLS handshake, protocol overhead
+    counted = 0
+    if body_transferred:
+        declared = resp.headers.get("content-length")
+        if declared and declared.isdigit():
+            counted += int(declared)
+        else:
+            # No Content-Length (chunked): fall back to the decoded body with
+            # a rough compression factor, the best estimate available.
+            counted += len(resp.text or "") // 4
+    counted += 400  # request headers, TLS handshake, protocol overhead
+    _bytes_used += counted
+    _bytes_by_path[path] = _bytes_by_path.get(path, 0) + counted
 
 
 def bytes_used() -> int:
     return _bytes_used
+
+
+def bytes_by_path() -> dict:
+    """Bytes attributed to each request type, largest first."""
+    return dict(sorted(_bytes_by_path.items(), key=lambda kv: -kv[1]))
 
 # Text Instagram serves on the "this account doesn't exist" page. Checked
 # against the HTML body when the page returns 200 instead of a clean 404.
@@ -202,7 +220,7 @@ async def warm_up_client(client: AsyncSession) -> None:
     Failures here are non-fatal — the checks still work without cookies."""
     try:
         resp = await client.get(f"{BASE_URL}/", headers=BROWSER_HEADERS, timeout=15)
-        _count_response(resp)
+        _count_response(resp, "warmup")
     except RequestException:
         pass
 
@@ -322,7 +340,8 @@ async def _probe_exists(username: str, client: AsyncSession) -> CheckResult:
     except RequestException as exc:
         return CheckResult(status=None, error=type(exc).__name__)
 
-    _count_response(resp)
+    # HEAD: Content-Length describes a body that was never sent.
+    _count_response(resp, "head-probe", body_transferred=False)
 
     if resp.status_code == 404:
         return CheckResult(status="not_found")
@@ -358,7 +377,7 @@ async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict
         return CheckResult(status=None, error=f"http_{resp.status_code}")
 
     page = resp.text or ""
-    _count_response(resp)
+    _count_response(resp, "page")
 
     if any(marker in page for marker in NOT_FOUND_MARKERS):
         return CheckResult(status="not_found")
@@ -427,7 +446,7 @@ async def _check_via_api(username: str, client: AsyncSession) -> CheckResult:
     except RequestException as exc:
         return CheckResult(status=None, error=type(exc).__name__)
 
-    _count_response(resp)
+    _count_response(resp, "api")
 
     if resp.status_code == 200:
         try:

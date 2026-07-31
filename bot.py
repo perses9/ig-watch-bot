@@ -14,6 +14,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 import storage
 from ig_checker import (
+    bytes_by_path,
     bytes_used,
     check_instagram_status,
     diagnose,
@@ -752,6 +753,18 @@ async def uptime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Projected: ~{per_month_gb:.2f} GB/month "
         f"(about ${per_month_gb * PROXY_COST_PER_GB:.2f} at ${PROXY_COST_PER_GB:g}/GB)",
     ]
+
+    # Which request type the data went to. A single total can only tell you
+    # the bill is wrong; this tells you which path to go and fix.
+    paths = bytes_by_path()
+    if used and paths:
+        lines.append("")
+        for name, count in paths.items():
+            lines.append(
+                f"  {name}: {count / 1048576:.1f} MB ({count * 100 // max(used, 1)}%)"
+            )
+        if CHECKS_RUN:
+            lines.append(f"  <i>~{used // CHECKS_RUN:,} bytes per check</i>")
     if elapsed < 900:
         lines.append("<i>Projection is rough until the bot has run a while.</i>")
 
