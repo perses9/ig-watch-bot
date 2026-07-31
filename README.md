@@ -24,6 +24,13 @@ and returns `401` from others. Since the proxy hands out a different IP per
 request, a refusal is retried (`API_ATTEMPTS`, default 6) rather than treated
 as failure. These responses are a few hundred bytes, so retrying is cheap.
 
+**Only the first 96KB of the page is read.** Everything the checker looks for
+lives in `<head>`; the remaining ~570KB is the JavaScript bundle. The read is
+aborted once that budget is spent, which genuinely stops the transfer rather
+than downloading and discarding it — this is the difference between ~100KB and
+~2KB per check on a metered proxy. If a truncated read settles nothing, the
+full page is fetched as a last resort (`PAGE_READ_LIMIT`).
+
 **The profile page is a fallback, not the primary.** Logged-out visitors now
 get a ~600KB JavaScript shell that frequently contains *no profile data at
 all* — no `og:` meta tags, no embedded JSON. When it does carry data, the
@@ -221,6 +228,7 @@ docker run -d --env-file .env -v $(pwd)/data:/data ig-watch-bot
 | `CONFIRM_CHECKS` | `2` | Agreeing checks needed before announcing a change |
 | `API_ATTEMPTS` | `6` | API retries across exit IPs before falling back to the page |
 | `CHECK_ATTEMPTS` | `1` | Page fetch attempts after the API gives up |
+| `PAGE_READ_LIMIT` | `98304` | Bytes of the page to read before aborting the transfer |
 | `ALLOWED_CHAT_IDS` | *(none)* | Static allowlist, comma-separated |
 | `MAX_GUEST_USERS` | `5` | How many people the owner can invite |
 | `ALLOW_DIRECT_FALLBACK` | `1` | Try unproxied when the proxy is unreachable |
@@ -231,7 +239,7 @@ docker run -d --env-file .env -v $(pwd)/data:/data ig-watch-bot
 python test_bot.py
 ```
 
-209 checks, no test dependencies. Covers status transitions and the debounce,
+220 checks, no test dependencies. Covers status transitions and the debounce,
 alert delivery and targeting, watchlist isolation between users, the access
 model (including that guests can't grant themselves access), every kind of
 Instagram response, cost shortcuts, and database upgrades from older schemas.

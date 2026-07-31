@@ -1039,6 +1039,66 @@ def test_live_accounts_are_polled_less_often():
           "it hasn't been established as live, so it can't take the cheap path")
 
 
+def test_page_reads_stop_early():
+    print("\nthe profile page isn't downloaded in full to read its <head>")
+
+    HEAD_PART = (
+        b"<html><head><title>Instagram</title>"
+        b'<meta property="og:title" content="Alex (@acct) o Instagram">'
+        b'<meta property="og:description" content="8,313 Followers - see photos">'
+        b"</head><body>"
+    )
+    BULK = b"x" * 700_000  # the JavaScript bundle we should never pay for
+
+    class Big(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            body = HEAD_PART + BULK
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass  # we hung up early, which is the point
+
+        def log_message(self, *a):
+            pass
+
+    HTTPServer.allow_reuse_address = True
+    server = HTTPServer(("127.0.0.1", 0), Big)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    original_base = ic.BASE_URL
+    ic.BASE_URL = f"http://127.0.0.1:{server.server_port}"
+    ic._bytes_used = 0
+    ic._bytes_by_path.clear()
+
+    async def run():
+        client = ic.make_client()
+        try:
+            result = await ic._fetch_profile_page("acct", client, ic._doc_headers())
+            check("the profile is still read correctly", result.status == "live",
+                  f"got {result.status or result.error}")
+            check("including the details from og: tags", result.full_name == "Alex",
+                  f"got {result.full_name!r}")
+            check("and the follower count", result.follower_count == 8313,
+                  f"got {result.follower_count}")
+            used = ic.bytes_used()
+            check("but the whole page was never downloaded",
+                  used < 200_000, f"counted {used:,} bytes of a 700KB page")
+            check("usage is booked against the page path",
+                  "page" in ic.bytes_by_path())
+        finally:
+            await client.close()
+            server.shutdown()
+            ic.BASE_URL = original_base
+            ic._bytes_used = 0
+            ic._bytes_by_path.clear()
+
+    asyncio.run(run())
+
+
 def test_head_requests_are_not_counted_as_full_pages():
     print("\na HEAD request isn't billed as the body it never sent")
 
@@ -1353,6 +1413,7 @@ def test_early_exit_does_not_starve_the_tail():
 
 def main():
     for test in (
+        test_page_reads_stop_early,
         test_head_requests_are_not_counted_as_full_pages,
         test_head_probe_rescues_an_inconclusive_check,
         test_check_button_always_shows_something,

@@ -78,6 +78,15 @@ def _count_response(resp, path: str = "other", body_transferred: bool = True) ->
     _bytes_by_path[path] = _bytes_by_path.get(path, 0) + counted
 
 
+def _count_bytes(count: int, path: str) -> None:
+    """Record a transfer we measured ourselves rather than read off a header -
+    a streamed response that was cut short has no honest Content-Length."""
+    global _bytes_used
+    total = count + 400
+    _bytes_used += total
+    _bytes_by_path[path] = _bytes_by_path.get(path, 0) + total
+
+
 def bytes_used() -> int:
     return _bytes_used
 
@@ -350,34 +359,70 @@ async def _probe_exists(username: str, client: AsyncSession) -> CheckResult:
     return CheckResult(status=None, error=f"head_{resp.status_code}")
 
 
+# How much of the profile page to read before giving up on it. Everything the
+# checker looks for - the not-found markers, the <title>, the og: tags - lives
+# in <head>, within the first few tens of KB. The remaining ~570KB is the
+# JavaScript bundle, and downloading it on a metered residential proxy is
+# where this bot's bill actually comes from.
+PAGE_READ_LIMIT = int(os.environ.get("PAGE_READ_LIMIT", str(96 * 1024)))
+
+
+async def _stream_page(url: str, client: AsyncSession, headers: dict):
+    """Fetch a page but stop reading once we have enough of it.
+
+    Returns (status_code, headers, text, bytes_read). Aborting the stream
+    early genuinely stops the transfer, so the proxy is never billed for the
+    tail we would have thrown away - unlike a Range header, which Instagram
+    is free to ignore.
+    """
+    read = 0
+    chunks = []
+    async with client.stream(
+        "GET", url, headers=headers, timeout=15, allow_redirects=False
+    ) as resp:
+        if resp.status_code != 200:
+            # Nothing to parse on a redirect or error; the status is the answer.
+            return resp.status_code, dict(resp.headers), "", read
+        async for chunk in resp.aiter_content():
+            chunks.append(chunk)
+            read += len(chunk)
+            if read >= PAGE_READ_LIMIT:
+                logger.debug("stopped reading %s after %d bytes", url, read)
+                break
+        body = b"".join(chunks)
+    # Cutting mid-stream can split a multi-byte character; replace rather than
+    # raise, since a mangled tail byte never changes a marker match.
+    return resp.status_code, dict(resp.headers), body.decode("utf-8", "replace"), read
+
+
 async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict) -> CheckResult:
     """One attempt at the public profile page. hl=en pins the response language:
     the proxy hands out IPs from random countries, and a localised page would
     break both the follower parsing and the not-found markers."""
     url = f"{BASE_URL}/{username}/?hl=en"
     try:
-        resp = await client.get(url, headers=headers, timeout=15, allow_redirects=False)
+        status_code, resp_headers, page, read = await _stream_page(url, client, headers)
     except RequestException as exc:
         return CheckResult(status=None, error=type(exc).__name__)
 
-    if resp.status_code == 404:
+    if status_code == 404:
         return CheckResult(status="not_found")
 
-    if resp.status_code == 429:
+    if status_code == 429:
         return CheckResult(status=None, error="rate_limited")
 
-    if resp.status_code in (301, 302, 303, 307, 308):
-        location = resp.headers.get("location", "")
+    if status_code in (301, 302, 303, 307, 308):
+        location = resp_headers.get("location", "")
         # A bounce to the login wall tells us nothing about the account itself.
         if "login" in location or "accounts" in location:
             return CheckResult(status=None, error="login_wall")
-        return CheckResult(status=None, error=f"redirect_{resp.status_code}")
+        return CheckResult(status=None, error=f"redirect_{status_code}")
 
-    if resp.status_code != 200:
-        return CheckResult(status=None, error=f"http_{resp.status_code}")
+    if status_code != 200:
+        return CheckResult(status=None, error=f"http_{status_code}")
 
-    page = resp.text or ""
-    _count_response(resp, "page")
+    _count_bytes(read, "page")
+    truncated = read >= PAGE_READ_LIMIT
 
     if any(marker in page for marker in NOT_FOUND_MARKERS):
         return CheckResult(status="not_found")
@@ -399,6 +444,40 @@ async def _fetch_profile_page(username: str, client: AsyncSession, headers: dict
     if any(marker in page for marker in LOGIN_WALL_MARKERS):
         return CheckResult(status=None, error="login_wall")
 
+    # Nothing conclusive, and the read was cut short - so the answer may be in
+    # the part we declined to download. Only now is the full page worth
+    # paying for, and only when there is demonstrably more of it.
+    if truncated:
+        logger.info("%s: first %dKB inconclusive, reading the full page",
+                    username, PAGE_READ_LIMIT // 1024)
+        return await _fetch_full_page(username, client, headers)
+
+    return CheckResult(status=None, error="no_profile_data")
+
+
+async def _fetch_full_page(username: str, client: AsyncSession, headers: dict) -> CheckResult:
+    """Last resort: the whole page, when a truncated read settled nothing."""
+    url = f"{BASE_URL}/{username}/?hl=en"
+    try:
+        resp = await client.get(url, headers=headers, timeout=20, allow_redirects=False)
+    except RequestException as exc:
+        return CheckResult(status=None, error=type(exc).__name__)
+    if resp.status_code != 200:
+        return CheckResult(status=None, error=f"http_{resp.status_code}")
+
+    page = resp.text or ""
+    _count_response(resp, "page-full")
+
+    if any(marker in page for marker in NOT_FOUND_MARKERS):
+        return CheckResult(status="not_found")
+    profile = _parse_profile_html(page)
+    if profile.get("full_name") or profile.get("follower_count") is not None:
+        return CheckResult(status="live", **profile)
+    embedded = _parse_embedded_json(page, username)
+    if embedded is not None:
+        return CheckResult(status="live", **embedded)
+    if any(marker in page for marker in LOGIN_WALL_MARKERS):
+        return CheckResult(status=None, error="login_wall")
     return CheckResult(status=None, error="no_profile_data")
 
 
